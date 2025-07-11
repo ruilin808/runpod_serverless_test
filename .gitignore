@@ -1,0 +1,11 @@
+test/
+venv/
+converted_table_dataset/
+output/
+
+# File types to ignore
+*.json
+*.arrow
+*.pt
+*.bin
+*.arrow
