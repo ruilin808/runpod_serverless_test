@@ -40,19 +40,33 @@ def create_swift_format_single(sample):
 def log_resources(logger, step="", samples_per_sec=None):
     """Log system resources and training metrics"""
     # GPU
-    gpu_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
-    gpu_util = torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else "N/A"
+    if torch.cuda.is_available():
+        gpu_mem_used = torch.cuda.memory_allocated() / 1024**3
+        gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_util = torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else "N/A"
+        gpu_info = f"{gpu_mem_used:.1f}/{gpu_mem_total:.1f}GB ({gpu_util}%)"
+    else:
+        gpu_info = "N/A"
     
-    # System resources
-    ram_percent = psutil.virtual_memory().percent
+    # System resources with totals
+    ram = psutil.virtual_memory()
+    ram_used = ram.used / 1024**3
+    ram_total = ram.total / 1024**3
+    ram_percent = ram.percent
+    
     cpu_percent = psutil.cpu_percent()
-    disk_percent = psutil.disk_usage('/').percent
+    cpu_count = psutil.cpu_count()
+    
+    disk = psutil.disk_usage('/')
+    disk_used = disk.used / 1024**3
+    disk_total = disk.total / 1024**3
+    disk_percent = (disk_used / disk_total) * 100
     
     # Format training speed
     speed_info = f" | Speed: {samples_per_sec:.3f} samples/s" if samples_per_sec else ""
     
-    logger.info(f"[{step}] GPU: {gpu_mem:.1f}GB ({gpu_util}%) | RAM: {ram_percent:.1f}% | "
-                f"CPU: {cpu_percent:.1f}% | Disk: {disk_percent:.1f}%{speed_info}")
+    logger.info(f"[{step}] GPU: {gpu_info} | RAM: {ram_used:.1f}/{ram_total:.1f}GB ({ram_percent:.1f}%) | "
+                f"CPU: {cpu_percent:.1f}% ({cpu_count} cores) | Disk: {disk_used:.1f}/{disk_total:.1f}GB ({disk_percent:.1f}%){speed_info}")
 
 
 class ResourceCallback(TrainerCallback):
@@ -94,7 +108,7 @@ def main():
     max_length = 32768
     
     # LoRA configuration
-    lora_rank = 2
+    lora_rank = 16
     lora_alpha = 32
     freeze_llm = False
     freeze_vit = True
@@ -104,7 +118,7 @@ def main():
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=1e-4,
-        per_device_train_batch_size=1,
+        per_device_train_batch_size=8,
         per_device_eval_batch_size=1,
         gradient_checkpointing=True,
         weight_decay=0.1,
@@ -116,14 +130,16 @@ def main():
         save_steps=50,
         eval_strategy='steps',
         eval_steps=50,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=2,
         num_train_epochs=3,
         metric_for_best_model='loss',
         save_total_limit=5,
         logging_steps=5,
         dataloader_num_workers=1,
+        dataloader_pin_memory=True,
         data_seed=data_seed,
         remove_unused_columns=False,
+        bf16=True,
     )
     
     # Log initial resources
