@@ -140,7 +140,7 @@ def main():
         data_seed=data_seed,
         remove_unused_columns=False,
         bf16=True,
-        optim='adamfactor',
+        optim='adafactor',
         max_grad_norm=1.0,
     )
     
