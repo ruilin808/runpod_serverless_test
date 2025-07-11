@@ -4,6 +4,8 @@ Qwen2-VL Fine-tuning Script for Table HTML Conversion
 """
 
 import os
+import psutil
+import torch
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
@@ -15,6 +17,7 @@ from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
+from transformers import TrainerCallback
 
 
 def create_swift_format_single(sample):
@@ -32,6 +35,50 @@ def create_swift_format_single(sample):
         ],
         'images': [sample['image']]
     }
+
+
+def log_resources(logger, step="", samples_per_sec=None):
+    """Log system resources and training metrics"""
+    # GPU
+    gpu_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+    gpu_util = torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else "N/A"
+    
+    # System resources
+    ram_percent = psutil.virtual_memory().percent
+    cpu_percent = psutil.cpu_percent()
+    disk_percent = psutil.disk_usage('/').percent
+    
+    # Format training speed
+    speed_info = f" | Speed: {samples_per_sec:.3f} samples/s" if samples_per_sec else ""
+    
+    logger.info(f"[{step}] GPU: {gpu_mem:.1f}GB ({gpu_util}%) | RAM: {ram_percent:.1f}% | "
+                f"CPU: {cpu_percent:.1f}% | Disk: {disk_percent:.1f}%{speed_info}")
+
+
+class ResourceCallback(TrainerCallback):
+    """Minimal callback for resource logging"""
+    def __init__(self, logger):
+        self.logger = logger
+        self.last_time = None
+        self.last_step = 0
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.global_step % 10 == 0:  # Log every 10 steps
+            # Calculate samples per second
+            if self.last_time and state.global_step > self.last_step:
+                import time
+                current_time = time.time()
+                steps_elapsed = state.global_step - self.last_step
+                time_elapsed = current_time - self.last_time
+                samples_per_sec = (steps_elapsed * args.per_device_train_batch_size * args.gradient_accumulation_steps) / time_elapsed
+                log_resources(self.logger, f"Step-{state.global_step}", samples_per_sec)
+                self.last_time = current_time
+                self.last_step = state.global_step
+            else:
+                import time
+                self.last_time = time.time()
+                self.last_step = state.global_step
+                log_resources(self.logger, f"Step-{state.global_step}")
 
 
 def main():
@@ -69,7 +116,7 @@ def main():
         save_steps=50,
         eval_strategy='steps',
         eval_steps=50,
-        gradient_accumulation_steps=4, ###########
+        gradient_accumulation_steps=4,
         num_train_epochs=3,
         metric_for_best_model='loss',
         save_total_limit=5,
@@ -78,6 +125,9 @@ def main():
         data_seed=data_seed,
         remove_unused_columns=False,
     )
+    
+    # Log initial resources
+    log_resources(logger, "START")
     
     # Load model and setup template
     model, processor = get_model_tokenizer(model_id_or_path)
@@ -106,6 +156,9 @@ def main():
     
     logger.info(f"Training: {len(train_dataset)}, Validation: {len(val_dataset)} samples")
     
+    # Clear GPU cache before training
+    torch.cuda.empty_cache()
+    
     # Train
     model.enable_input_require_grads()
     trainer = Seq2SeqTrainer(
@@ -115,8 +168,13 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
+        callbacks=[ResourceCallback(logger)],
     )
+    
     trainer.train()
+    
+    # Log final resources
+    log_resources(logger, "END")
     
     # Save visualization
     visual_loss_dir = os.path.join(os.path.abspath(output_dir), 'visual_loss')
