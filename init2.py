@@ -278,19 +278,21 @@ class ResourceCallback(TrainerCallback):
                 log_resources(self.logger, f"Step-{state.global_step}")
     
     def on_evaluate(self, args, state, control, logs=None, **kwargs):
-        """Run TEDS evaluation during training evaluation"""
+        """Run TEDS evaluation after training evaluation"""
         if self.teds_evaluator and self.eval_dataset and state.global_step > 0:
             try:
+                # Run TEDS evaluation but don't tie it to model selection
                 teds_results = self.teds_evaluator.evaluate_samples(self.eval_dataset, MAX_EVAL_SAMPLES_TRAINING)
-                
-                # Add to logs
-                if logs is not None:
-                    logs.update(teds_results)
                 
                 self.logger.info(f"[Step {state.global_step}] TEDS Evaluation:")
                 self.logger.info(f"  Structure + Content: {teds_results['eval_teds_structure_content']:.4f}")
                 self.logger.info(f"  Structure only: {teds_results['eval_teds_structure_only']:.4f}")
                 self.logger.info(f"  Samples evaluated: {teds_results['eval_teds_samples']}")
+                
+                # Log to tensorboard if available
+                if hasattr(state, 'log_history'):
+                    # Add TEDS metrics to the log history for tensorboard tracking
+                    state.log_history[-1].update(teds_results)
                 
             except Exception as e:
                 self.logger.error(f"TEDS evaluation failed: {e}")
@@ -340,8 +342,8 @@ def main():
         eval_steps=50,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
-        metric_for_best_model='eval_teds_structure_content',
-        greater_is_better=True,
+        metric_for_best_model='eval_loss',  # Use eval_loss as fallback
+        greater_is_better=False,  # Lower loss is better
         load_best_model_at_end=True,
         save_total_limit=5,
         logging_steps=5,
