@@ -108,7 +108,7 @@ def main():
     max_length = 32768
     
     # LoRA configuration
-    lora_rank = 16
+    lora_rank = 8
     lora_alpha = 32
     freeze_llm = False
     freeze_vit = True
@@ -118,7 +118,7 @@ def main():
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=1e-4,
-        per_device_train_batch_size=8,
+        per_device_train_batch_size=4,
         per_device_eval_batch_size=1,
         gradient_checkpointing=True,
         weight_decay=0.1,
@@ -130,13 +130,13 @@ def main():
         save_steps=50,
         eval_strategy='steps',
         eval_steps=50,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=4,
         num_train_epochs=3,
         metric_for_best_model='loss',
         save_total_limit=5,
         logging_steps=5,
         dataloader_num_workers=1,
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=False,
         data_seed=data_seed,
         remove_unused_columns=False,
         bf16=True,
