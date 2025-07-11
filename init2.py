@@ -44,7 +44,7 @@ def main():
     model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
     output_dir = 'output'
     data_seed = 42
-    max_length = 16384
+    max_length = 32768
     
     # LoRA configuration
     lora_rank = 2
