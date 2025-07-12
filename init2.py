@@ -147,7 +147,6 @@ class TEDSEvaluator:
                 
                 # Prepare generation kwargs
                 generation_kwargs = {
-                    'device': self.device,
                     'use_cache': False,
                     'pad_token_id': self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
                 }
@@ -157,7 +156,10 @@ class TEDSEvaluator:
                                       ('pixel_values', 'pixel_values'),
                                       ('image_grid_thw', 'image_grid_thw')]:
                     if key in inputs:
-                        tensor = torch.tensor(inputs[key], device=self.device)
+                        if isinstance(inputs[key], torch.Tensor):
+                            tensor = inputs[key].clone().detach().to(self.device)
+                        else:
+                            tensor = torch.tensor(inputs[key], device=self.device)
                         if tensor.dim() == 1 and key != 'pixel_values':
                             tensor = tensor.unsqueeze(0)
                         generation_kwargs[tensor_key] = tensor
@@ -279,7 +281,8 @@ class ResourceCallback(TrainerCallback):
     
     def on_evaluate(self, args, state, control, logs=None, **kwargs):
         """Run TEDS evaluation after training evaluation"""
-        if self.teds_evaluator and self.eval_dataset and state.global_step > 0:
+        # Only run TEDS after some training progress to avoid empty generations
+        if self.teds_evaluator and self.eval_dataset and state.global_step >= 100:
             try:
                 # Run TEDS evaluation but don't tie it to model selection
                 teds_results = self.teds_evaluator.evaluate_samples(self.eval_dataset, MAX_EVAL_SAMPLES_TRAINING)
@@ -296,6 +299,8 @@ class ResourceCallback(TrainerCallback):
                 
             except Exception as e:
                 self.logger.error(f"TEDS evaluation failed: {e}")
+        elif self.teds_evaluator and state.global_step < 100:
+            self.logger.info(f"[Step {state.global_step}] Skipping TEDS evaluation - waiting for step 100+ for meaningful generations")
 
 
 def main():
