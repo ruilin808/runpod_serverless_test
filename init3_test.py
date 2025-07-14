@@ -35,14 +35,32 @@ except ImportError:
 
 
 def create_swift_format_single(sample):
-    """Convert single sample to Swift format"""
-    return {
-        'messages': [
-            {'role': 'user', 'content': 'Write the HTML representation for this image of a medical table.'},
-            {'role': 'assistant', 'content': sample['html_table']}
-        ],
-        'images': [sample['image']]
-    }
+    """Convert single sample to Swift format with error handling"""
+    try:
+        # Ensure HTML content is properly formatted and not too long
+        html_content = sample.get('html_table', '').strip()
+        
+        # Basic validation
+        if not html_content:
+            logger.warning(f"Empty HTML content in sample, skipping...")
+            return None
+            
+        # Truncate extremely long HTML (rough estimate: 1 token ~= 4 chars)
+        max_html_chars = 20000  # ~5000 tokens for HTML content
+        if len(html_content) > max_html_chars:
+            logger.warning(f"Truncating HTML from {len(html_content)} to {max_html_chars} chars")
+            html_content = html_content[:max_html_chars] + "..."
+        
+        return {
+            'messages': [
+                {'role': 'user', 'content': 'Write the HTML representation for this image of a medical table.'},
+                {'role': 'assistant', 'content': html_content}
+            ],
+            'images': [sample['image']]
+        }
+    except Exception as e:
+        logger.warning(f"Error processing sample: {e}")
+        return None
 
 
 def log_resources(logger, step="", samples_per_sec=None):
@@ -133,12 +151,16 @@ class OptimizedTEDSEvaluator:
                                 tensor = tensor.unsqueeze(0)
                             generation_kwargs[tensor_key] = tensor
                     
-                    # Generate
+                    # Generate with more conservative settings to avoid CUDA errors
                     outputs = self.model.generate(
                         input_ids, 
                         max_new_tokens=max_new_tokens,
                         num_beams=1,
+                        do_sample=False,
+                        temperature=1.0,
+                        top_p=1.0,
                         eos_token_id=self.processor.tokenizer.eos_token_id,
+                        pad_token_id=self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id,
                         **generation_kwargs
                     )
                     
@@ -319,9 +341,13 @@ class OptimizedResourceCallback(TrainerCallback):
 
 
 def main():
-    """Main training function with optimizations"""
+    """Main training function with optimizations and error handling"""
     logger = get_logger()
     seed_everything(42)
+    
+    # DEBUGGING: Enable CUDA error detection
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    os.environ['TORCH_USE_CUDA_DSA'] = '1'
     
     # Configuration
     model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
@@ -335,7 +361,7 @@ def main():
     
     logger.info(f"Optimized training setup: {gpu_count} GPUs, grad_accum={gradient_accumulation_steps}, expected_steps={expected_steps}")
     
-    # Optimized training arguments
+    # Optimized training arguments with CUDA error fixes
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=1e-4,
@@ -358,7 +384,7 @@ def main():
         load_best_model_at_end=True,
         save_total_limit=3,  # OPTIMIZED: Keep fewer checkpoints
         logging_steps=5,
-        dataloader_num_workers=2,  # OPTIMIZED: More data loading workers
+        dataloader_num_workers=1,  # FIXED: Reduce to 1 to avoid multiprocessing issues
         data_seed=42,
         remove_unused_columns=False,
         bf16=True,
@@ -366,7 +392,10 @@ def main():
         max_grad_norm=1.0,
         dataloader_drop_last=True,
         ddp_find_unused_parameters=False,
-        dataloader_pin_memory=True,  # OPTIMIZED: Pin memory for faster transfer
+        dataloader_pin_memory=False,  # FIXED: Disable to avoid memory issues
+        ignore_data_skip=True,  # FIXED: Skip problematic data instead of crashing
+        prediction_loss_only=True,  # FIXED: Only compute loss, not predictions
+        include_inputs_for_metrics=False,  # FIXED: Reduce memory usage
     )
     
     log_resources(logger, "START")
@@ -374,7 +403,15 @@ def main():
     # Load model and setup
     logger.info("Loading model...")
     model, processor = get_model_tokenizer(model_id_or_path)
-    template = get_template(model.model_meta.template, processor, max_length=16384)  # OPTIMIZED: Reduced max length
+    
+    # FIXED: Use larger max_length to handle long HTML sequences
+    # and add truncation strategy
+    template = get_template(
+        model.model_meta.template, 
+        processor, 
+        max_length=24576,  # Increased to handle long HTML
+        truncation_strategy='delete'  # Delete samples that are too long instead of random sampling
+    )
     template.set_mode('train')
     if template.use_model:
         template.model = model
@@ -387,14 +424,42 @@ def main():
     
     logger.info(f'Model: {get_model_parameter_info(model)}')
     
-    # Load and process dataset
+    # Load and process dataset with filtering
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
-    train_processed = raw_dataset['train'].map(create_swift_format_single)
-    val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
-    train_dataset = LazyLLMDataset(train_processed, template.encode, random_state=42)
-    val_dataset = LazyLLMDataset(val_processed, template.encode, random_state=42)
+    # Process and filter out None samples
+    train_processed_raw = raw_dataset['train'].map(create_swift_format_single)
+    val_processed_raw = raw_dataset['validation'].map(create_swift_format_single)
+    
+    # Filter out None samples (failed processing)
+    train_processed = train_processed_raw.filter(lambda x: x is not None)
+    val_processed = val_processed_raw.filter(lambda x: x is not None)
+    
+    logger.info(f"Dataset filtering: Train {len(raw_dataset['train'])} -> {len(train_processed)} samples")
+    logger.info(f"Dataset filtering: Val {len(raw_dataset['validation'])} -> {len(val_processed)} samples")
+    
+    # Create datasets with error handling
+    try:
+        train_dataset = LazyLLMDataset(train_processed, template.encode, random_state=42)
+        val_dataset = LazyLLMDataset(val_processed, template.encode, random_state=42)
+    except Exception as e:
+        logger.error(f"Error creating datasets: {e}")
+        logger.info("Trying with smaller max_length...")
+        
+        # Fallback: reduce max_length if still having issues
+        template = get_template(
+            model.model_meta.template, 
+            processor, 
+            max_length=20480,
+            truncation_strategy='delete'
+        )
+        template.set_mode('train')
+        if template.use_model:
+            template.model = model
+            
+        train_dataset = LazyLLMDataset(train_processed, template.encode, random_state=42)
+        val_dataset = LazyLLMDataset(val_processed, template.encode, random_state=42)
     
     logger.info(f"Dataset: {len(train_dataset)} train, {len(val_dataset)} validation samples")
     
