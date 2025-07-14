@@ -302,7 +302,6 @@ def main():
     logger.info("Loading model...")
     model_kwargs = {
         'device_map': 'auto',
-        'torch_dtype': torch.bfloat16,
         'low_cpu_mem_usage': True,
         'max_memory': {i: "20GiB" for i in range(gpu_count)} if torch.cuda.is_available() else None
     }
