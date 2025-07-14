@@ -25,6 +25,33 @@ except ImportError:
     raise
 
 
+class SwiftDataParallel(torch.nn.DataParallel):
+    """DataParallel wrapper that preserves Swift model attributes"""
+    
+    def __init__(self, module, device_ids=None, output_device=None, dim=0):
+        super().__init__(module, device_ids, output_device, dim)
+        
+        # Preserve Swift-specific attributes
+        if hasattr(module, 'model_meta'):
+            self.model_meta = module.model_meta
+        if hasattr(module, 'generation_config'):
+            self.generation_config = module.generation_config
+        if hasattr(module, 'config'):
+            self.config = module.config
+        if hasattr(module, 'enable_input_require_grads'):
+            self.enable_input_require_grads = module.enable_input_require_grads
+    
+    def __getattr__(self, name):
+        """Fallback to module attributes for Swift compatibility"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            # Try to get attribute from the wrapped module
+            if hasattr(self.module, name):
+                return getattr(self.module, name)
+            raise
+
+
 class GPUManager:
     """Centralized GPU management and monitoring"""
     
@@ -324,8 +351,8 @@ def main():
     
     # Wrap with DataParallel for multi-GPU if available
     if use_multi_gpu:
-        logger.info(f"Wrapping model with DataParallel for {gpu_manager.gpu_count} GPUs")
-        model = torch.nn.DataParallel(model)
+        logger.info(f"Wrapping model with SwiftDataParallel for {gpu_manager.gpu_count} GPUs")
+        model = SwiftDataParallel(model)
     
     logger.info(f'Model: {get_model_parameter_info(model)}')
     
