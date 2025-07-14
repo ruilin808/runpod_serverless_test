@@ -319,6 +319,9 @@ def main():
     lora_config = LoraConfig(task_type='CAUSAL_LM', r=4, lora_alpha=16, target_modules=target_modules)
     model = Swift.prepare_model(model, lora_config)
     
+    # Enable input gradients BEFORE wrapping with DataParallel
+    model.enable_input_require_grads()
+    
     # Wrap with DataParallel for multi-GPU if available
     if use_multi_gpu:
         logger.info(f"Wrapping model with DataParallel for {gpu_manager.gpu_count} GPUs")
@@ -342,7 +345,6 @@ def main():
     
     # Train
     logger.info("Starting training...")
-    model.enable_input_require_grads()
     
     trainer = Seq2SeqTrainer(
         model=model,
