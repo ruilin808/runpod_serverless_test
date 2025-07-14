@@ -51,28 +51,11 @@ class GPUManager:
             with torch.cuda.device(i):
                 torch.cuda.empty_cache()
     
-    def get_available_backend(self):
-        """Detect best available distributed backend"""
-        if self.gpu_count <= 1:
-            return None
-            
-        # Check for NCCL availability
-        try:
-            if torch.distributed.is_nccl_available():
-                return 'nccl'
-        except:
-            pass
-        
-        # Fallback to GLOO
-        try:
-            if torch.distributed.is_gloo_available():
-                self.logger.info("NCCL not available, using GLOO backend")
-                return 'gloo'
-        except:
-            pass
-        
-        self.logger.warning("No distributed backend available, using single GPU")
-        return None
+    def should_use_distributed(self):
+        """Check if we should use distributed training"""
+        # For simplicity, let's use DataParallel for multi-GPU instead of DDP
+        # This avoids the complexity of process group initialization
+        return self.gpu_count > 1
     
     def get_gpu_info(self, force_refresh=False):
         """Get GPU info with caching"""
@@ -160,12 +143,15 @@ class TEDSEvaluator:
         try:
             device = f'cuda:{self.gpu_manager.get_best_gpu()}' if self.gpu_manager.gpu_count > 0 else 'cpu'
             
-            self.model.eval()
+            # Handle DataParallel wrapped models
+            model_for_generation = self.model.module if hasattr(self.model, 'module') else self.model
+            
+            model_for_generation.eval()
             with torch.no_grad():
                 generation_kwargs = self._prepare_inputs(sample, device)
                 input_ids = generation_kwargs.pop('input_ids')
                 
-                outputs = self.model.generate(input_ids, max_new_tokens=max_new_tokens, **generation_kwargs)
+                outputs = model_for_generation.generate(input_ids, max_new_tokens=max_new_tokens, **generation_kwargs)
                 prediction = self.processor.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
                 
                 # Clear cache only when using GPU
@@ -277,11 +263,11 @@ def main():
     gradient_accumulation_steps = max(4 // effective_gpu_count, 1)
     per_device_batch_size = 1
     
-    # Get available backend
-    distributed_backend = gpu_manager.get_available_backend()
+    # Check if we should use multi-GPU
+    use_multi_gpu = gpu_manager.should_use_distributed()
     
     logger.info(f"Training setup: {effective_gpu_count} GPUs, batch_size={per_device_batch_size}, "
-                f"grad_accum={gradient_accumulation_steps}, backend={distributed_backend}")
+                f"grad_accum={gradient_accumulation_steps}, multi_gpu={use_multi_gpu}")
     
     # Training arguments
     training_args = Seq2SeqTrainingArguments(
@@ -312,9 +298,9 @@ def main():
         optim='adafactor',
         max_grad_norm=1.0,
         dataloader_drop_last=True,
-        ddp_find_unused_parameters=False,
-        ddp_backend=distributed_backend,
         dataloader_pin_memory=True,
+        # Remove DDP settings to avoid initialization issues
+        # Will use DataParallel instead if multiple GPUs
     )
     
     gpu_manager.log_status("START")
@@ -332,6 +318,11 @@ def main():
     target_modules = get_multimodal_target_regex(model, freeze_llm=False, freeze_vit=True, freeze_aligner=True)
     lora_config = LoraConfig(task_type='CAUSAL_LM', r=4, lora_alpha=16, target_modules=target_modules)
     model = Swift.prepare_model(model, lora_config)
+    
+    # Wrap with DataParallel for multi-GPU if available
+    if use_multi_gpu:
+        logger.info(f"Wrapping model with DataParallel for {gpu_manager.gpu_count} GPUs")
+        model = torch.nn.DataParallel(model)
     
     logger.info(f'Model: {get_model_parameter_info(model)}')
     
