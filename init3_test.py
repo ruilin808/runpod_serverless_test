@@ -42,19 +42,37 @@ class GPUManager:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(i) for i in range(self.gpu_count))
         
         if self.gpu_count > 1:
-            os.environ.update({
-                'WORLD_SIZE': str(self.gpu_count),
-                'MASTER_ADDR': 'localhost',
-                'MASTER_PORT': '12355',
-                'NCCL_SOCKET_IFNAME': 'lo'
-            })
-            self.logger.info(f"Configured distributed training for {self.gpu_count} GPUs")
+            # Don't set distributed environment vars here - let training_args handle it
+            self.logger.info(f"Detected {self.gpu_count} GPUs for distributed training")
         
         # Set memory fraction and clear cache
         for i in range(self.gpu_count):
             torch.cuda.set_per_process_memory_fraction(0.85, device=i)
             with torch.cuda.device(i):
                 torch.cuda.empty_cache()
+    
+    def get_available_backend(self):
+        """Detect best available distributed backend"""
+        if self.gpu_count <= 1:
+            return None
+            
+        # Check for NCCL availability
+        try:
+            if torch.distributed.is_nccl_available():
+                return 'nccl'
+        except:
+            pass
+        
+        # Fallback to GLOO
+        try:
+            if torch.distributed.is_gloo_available():
+                self.logger.info("NCCL not available, using GLOO backend")
+                return 'gloo'
+        except:
+            pass
+        
+        self.logger.warning("No distributed backend available, using single GPU")
+        return None
     
     def get_gpu_info(self, force_refresh=False):
         """Get GPU info with caching"""
@@ -259,8 +277,11 @@ def main():
     gradient_accumulation_steps = max(4 // effective_gpu_count, 1)
     per_device_batch_size = 1
     
+    # Get available backend
+    distributed_backend = gpu_manager.get_available_backend()
+    
     logger.info(f"Training setup: {effective_gpu_count} GPUs, batch_size={per_device_batch_size}, "
-                f"grad_accum={gradient_accumulation_steps}")
+                f"grad_accum={gradient_accumulation_steps}, backend={distributed_backend}")
     
     # Training arguments
     training_args = Seq2SeqTrainingArguments(
@@ -292,7 +313,7 @@ def main():
         max_grad_norm=1.0,
         dataloader_drop_last=True,
         ddp_find_unused_parameters=False,
-        ddp_backend='nccl' if gpu_manager.gpu_count > 1 else None,
+        ddp_backend=distributed_backend,
         dataloader_pin_memory=True,
     )
     
