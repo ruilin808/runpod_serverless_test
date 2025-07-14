@@ -291,8 +291,6 @@ def main():
         max_steps=expected_steps,
         dataloader_pin_memory=False,  # Disable pin memory
         ignore_data_skip=True,
-        # Model parallel settings
-        model_parallel=True if gpu_count > 1 else False,
         # Additional memory optimizations
         prediction_loss_only=True,
         include_inputs_for_metrics=False,
