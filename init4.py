@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Qwen2-VL Fine-tuning Script for Table HTML Conversion with TEDS Evaluation
+Enhanced with multi-GPU optimizations and advanced monitoring
 """
 
 import os
@@ -8,6 +9,7 @@ import psutil
 import torch
 import time
 import numpy as np
+import gc
 
 # Use all available GPUs
 if torch.cuda.is_available():
@@ -30,6 +32,16 @@ except ImportError:
     print("TEDS library not found. Install with: pip install table-recognition-metric")
     raise
 
+# Optional GPU monitoring
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    PYNVML_AVAILABLE = True
+    print("pynvml loaded for enhanced GPU monitoring")
+except ImportError:
+    PYNVML_AVAILABLE = False
+    print("pynvml not available - install with: pip install pynvml")
+
 
 def create_swift_format_single(sample):
     """Convert single sample to Swift format"""
@@ -42,30 +54,212 @@ def create_swift_format_single(sample):
     }
 
 
-def log_resources(logger, step="", samples_per_sec=None):
-    """Log system resources and training metrics"""
-    # GPU info
-    if torch.cuda.is_available():
-        gpu_info = " | ".join([f"GPU{i}: {torch.cuda.memory_allocated(i)/1024**3:.1f}/{torch.cuda.get_device_properties(i).total_memory/1024**3:.1f}GB" 
-                              for i in range(torch.cuda.device_count())])
+def calculate_training_params(gpu_count, logger):
+    """Calculate optimal training parameters based on GPU count"""
+    # Configuration
+    min_effective_batch = 8      # Minimum for training stability
+    target_per_device_batch = 2  # Preferred batch size per GPU
+    max_memory_per_device = 4    # Maximum samples per device (memory constraint)
+    
+    # Start with target batch size
+    per_device_batch = min(target_per_device_batch, max_memory_per_device)
+    
+    # Calculate required gradient accumulation
+    base_effective = per_device_batch * gpu_count
+    
+    if base_effective >= min_effective_batch:
+        # We can achieve minimum with current setup
+        gradient_accumulation_steps = 1
     else:
-        gpu_info = "N/A"
+        # Need gradient accumulation to reach minimum
+        gradient_accumulation_steps = max(1, min_effective_batch // base_effective)
+    
+    # Check if we exceed memory constraints
+    total_memory_per_device = per_device_batch * gradient_accumulation_steps
+    if total_memory_per_device > max_memory_per_device:
+        # Reduce per-device batch and increase gradient accumulation
+        per_device_batch = 1
+        gradient_accumulation_steps = max(1, min_effective_batch // gpu_count)
+    
+    effective_batch = per_device_batch * gpu_count * gradient_accumulation_steps
+    
+    logger.info(f"Training config: {per_device_batch} per-device × {gpu_count} GPUs × {gradient_accumulation_steps} accum = {effective_batch} effective")
+    
+    return per_device_batch, gradient_accumulation_steps, effective_batch
+
+
+def get_gpu_info(gpu_id):
+    """Get comprehensive GPU information for a single GPU"""
+    if not torch.cuda.is_available():
+        return None
+    
+    try:
+        # Memory stats
+        allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
+        reserved = torch.cuda.memory_reserved(gpu_id) / 1024**3
+        total_mem = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
+        
+        gpu_info = {
+            'allocated': allocated,
+            'reserved': reserved,
+            'total': total_mem,
+            'fragmentation': (reserved - allocated) / total_mem * 100 if total_mem > 0 else 0
+        }
+        
+        # Enhanced metrics (if pynvml available)
+        if PYNVML_AVAILABLE:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+                utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                gpu_info['utilization'] = utilization.gpu
+                
+                # Temperature
+                gpu_info['temperature'] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                
+                # Power (with safer API call)
+                try:
+                    power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                    gpu_info['power'] = power
+                    # Try to get power limit, fallback if not available
+                    try:
+                        power_limit = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
+                        gpu_info['power_limit'] = power_limit
+                    except:
+                        gpu_info['power_limit'] = None
+                except:
+                    gpu_info['power'] = None
+                    gpu_info['power_limit'] = None
+                    
+            except Exception:
+                gpu_info.update({'utilization': None, 'temperature': None, 'power': None, 'power_limit': None})
+        else:
+            gpu_info.update({'utilization': None, 'temperature': None, 'power': None, 'power_limit': None})
+        
+        return gpu_info
+        
+    except Exception:
+        return None
+
+
+def log_resources(logger, step="", samples_per_sec=None):
+    """Enhanced resource logging with detailed GPU metrics"""
+    
+    # GPU detailed monitoring
+    if torch.cuda.is_available():
+        gpu_details = []
+        total_allocated = 0
+        total_capacity = 0
+        
+        for i in range(torch.cuda.device_count()):
+            gpu_info = get_gpu_info(i)
+            if gpu_info is None:
+                continue
+                
+            total_allocated += gpu_info['allocated']
+            total_capacity += gpu_info['total']
+            
+            # Format GPU info string
+            util_str = f"{gpu_info['utilization']}%" if gpu_info['utilization'] is not None else "N/A"
+            temp_str = f"{gpu_info['temperature']}°C" if gpu_info['temperature'] is not None else "N/A"
+            
+            if gpu_info['power'] is not None:
+                if gpu_info['power_limit'] is not None:
+                    power_str = f"{gpu_info['power']:.0f}/{gpu_info['power_limit']:.0f}W"
+                else:
+                    power_str = f"{gpu_info['power']:.0f}W"
+            else:
+                power_str = "N/A"
+            
+            gpu_details.append(
+                f"GPU{i}: {gpu_info['allocated']:.1f}/{gpu_info['total']:.1f}GB "
+                f"(Util:{util_str}, Frag:{gpu_info['fragmentation']:.1f}%, "
+                f"Temp:{temp_str}, Power:{power_str})"
+            )
+        
+        gpu_summary = " | ".join(gpu_details)
+        avg_utilization = total_allocated / total_capacity * 100 if total_capacity > 0 else 0
+        
+    else:
+        gpu_summary = "N/A"
+        avg_utilization = 0
     
     # System resources
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
+    
+    # Network I/O (with specific exception handling)
+    try:
+        net_io = psutil.net_io_counters()
+        if net_io:
+            network_str = f"Net: {net_io.bytes_sent/1024**3:.1f}GB↑/{net_io.bytes_recv/1024**3:.1f}GB↓"
+        else:
+            network_str = "Net: N/A"
+    except (AttributeError, OSError):
+        network_str = "Net: N/A"
+    
+    # Training speed
     speed_info = f" | Speed: {samples_per_sec:.3f} samples/s" if samples_per_sec else ""
     
-    logger.info(f"[{step}] {gpu_info} | RAM: {ram.used/1024**3:.1f}/{ram.total/1024**3:.1f}GB ({ram.percent:.1f}%) | "
+    # Consolidated logging
+    if len(gpu_details) <= 2:  # Single line for 1-2 GPUs
+        logger.info(f"[{step}] {gpu_summary}")
+    else:  # Multi-line for many GPUs
+        logger.info(f"[{step}] GPUs: {len(gpu_details)} total")
+        for detail in gpu_details:
+            logger.info(f"[{step}]   {detail}")
+    
+    logger.info(f"[{step}] Overall GPU: {avg_utilization:.1f}% | "
+                f"RAM: {ram.used/1024**3:.1f}/{ram.total/1024**3:.1f}GB ({ram.percent:.1f}%) | "
                 f"CPU: {psutil.cpu_percent():.1f}% ({psutil.cpu_count()} cores) | "
-                f"Disk: {disk.used/1024**3:.1f}/{disk.total/1024**3:.1f}GB ({disk.used/disk.total*100:.1f}%){speed_info}")
+                f"Disk: {disk.used/1024**3:.1f}/{disk.total/1024**3:.1f}GB | "
+                f"{network_str}{speed_info}")
+
+
+def log_memory_breakdown(logger, step=""):
+    """Detailed memory breakdown for debugging - simplified to avoid redundancy"""
+    if not torch.cuda.is_available():
+        return
+        
+    logger.info(f"[{step}] MEMORY BREAKDOWN:")
+    
+    for i in range(torch.cuda.device_count()):
+        gpu_info = get_gpu_info(i)
+        if gpu_info is None:
+            continue
+            
+        # Get peak memory
+        max_allocated = torch.cuda.max_memory_allocated(i) / 1024**3
+        
+        logger.info(f"  GPU {i}: Current={gpu_info['allocated']:.1f}GB, "
+                   f"Reserved={gpu_info['reserved']:.1f}GB, Peak={max_allocated:.1f}GB")
+        
+        # Reset peak memory stats for next measurement
+        torch.cuda.reset_peak_memory_stats(i)
 
 
 class TEDSEvaluator:
-    """TEDS evaluator for table structure recognition"""
+    """TEDS evaluator for table structure recognition with enhanced multi-GPU support"""
     
     def __init__(self, model, processor, template, logger):
-        self.model = model
+        # Enhanced device management for multi-GPU
+        if hasattr(model, 'module'):  # DDP wrapped model
+            self.model = model.module  # Get the actual model
+            # For DDP, get device from first parameter (they should all be on same device per process)
+            try:
+                self.device = next(iter(model.module.parameters())).device
+                logger.info(f"TEDS: Using DDP-wrapped model on device: {self.device}")
+            except StopIteration:
+                self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+                logger.warning(f"TEDS: No parameters found, defaulting to device: {self.device}")
+        else:  # Single GPU or non-DDP
+            self.model = model
+            try:
+                self.device = next(iter(model.parameters())).device
+                logger.info(f"TEDS: Using single GPU device: {self.device}")
+            except StopIteration:
+                self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+                logger.warning(f"TEDS: No parameters found, defaulting to device: {self.device}")
+        
         self.processor = processor
         self.template = template
         self.logger = logger
@@ -80,159 +274,72 @@ class TEDSEvaluator:
         """Generate HTML prediction for a sample"""
         try:
             self.model.eval()
-            
-            # Get current device from model
-            device = next(self.model.parameters()).device
-            
             with torch.no_grad():
-                # Properly format the input for generation
-                messages = [sample['messages'][0]]  # User message only
-                images = sample.get('images', [])
-                
-                # Encode input with proper template
-                inputs = self.template.encode({
-                    'messages': messages, 
-                    'images': images
-                })
-                
-                # Move tensors to correct device
-                input_ids = torch.tensor(inputs['input_ids'], dtype=torch.long, device=device).unsqueeze(0)
+                # Encode input
+                inputs = self.template.encode({'messages': [sample['messages'][0]], 'images': sample.get('images', [])})
+                input_ids = torch.tensor(inputs['input_ids'], dtype=torch.long, device=self.device).unsqueeze(0)
                 
                 # Prepare generation kwargs
-                generation_kwargs = {
-                    'use_cache': False,
-                    'pad_token_id': self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id,
-                    'max_new_tokens': max_new_tokens,
-                    'num_beams': 1,
-                    'do_sample': False,
-                    'eos_token_id': self.processor.tokenizer.eos_token_id,
-                    'temperature': 1.0,
-                    'top_p': 1.0
-                }
+                generation_kwargs = {'use_cache': False, 'pad_token_id': self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id}
                 
-                # Add other inputs with proper device handling
-                for key, tensor_key in [
-                    ('attention_mask', 'attention_mask'), 
-                    ('pixel_values', 'pixel_values'), 
-                    ('image_grid_thw', 'image_grid_thw')
-                ]:
-                    if key in inputs and inputs[key] is not None:
-                        tensor = inputs[key]
-                        if not isinstance(tensor, torch.Tensor):
-                            tensor = torch.tensor(tensor)
-                        
-                        tensor = tensor.to(device)
-                        
-                        # Ensure proper batch dimension
+                # Add other inputs
+                for key, tensor_key in [('attention_mask', 'attention_mask'), ('pixel_values', 'pixel_values'), ('image_grid_thw', 'image_grid_thw')]:
+                    if key in inputs:
+                        tensor = (inputs[key].clone().detach() if isinstance(inputs[key], torch.Tensor) 
+                                else torch.tensor(inputs[key])).to(self.device)
                         if tensor.dim() == 1 and key != 'pixel_values':
                             tensor = tensor.unsqueeze(0)
-                        elif key == 'pixel_values' and tensor.dim() == 4:
-                            # pixel_values might need proper batching
-                            pass
-                        
                         generation_kwargs[tensor_key] = tensor
                 
-                # Generate
-                with torch.cuda.amp.autocast(enabled=False):  # Disable autocast for generation
-                    outputs = self.model.generate(input_ids, **generation_kwargs)
-                
-                # Decode only the generated part
-                generated_tokens = outputs[0][input_ids.shape[1]:]
-                prediction = self.processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                
+                # Generate and decode
+                outputs = self.model.generate(input_ids, max_new_tokens=max_new_tokens, num_beams=1, 
+                                            do_sample=False, eos_token_id=self.processor.tokenizer.eos_token_id, **generation_kwargs)
+                prediction = self.processor.tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
                 return prediction.strip()
                 
-        except torch.cuda.OutOfMemoryError as e:
-            self.logger.error(f"CUDA OOM during generation: {e}")
-            torch.cuda.empty_cache()
-            return ""
         except Exception as e:
-            self.logger.error(f"Generation error: {type(e).__name__}: {e}")
+            self.logger.warning(f"Generation error: {e}")
             return ""
-        finally:
-            # Always cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
     
     def evaluate_samples(self, eval_dataset, max_samples):
         """Evaluate TEDS scores on a subset of samples"""
         self.logger.info(f"TEDS EVALUATION ON {min(max_samples, len(eval_dataset))} SAMPLES")
         
-        structure_content_scores = []
-        structure_only_scores = []
-        successful = 0
+        structure_content_scores, structure_only_scores, successful = [], [], 0
         
-        # Set model to eval mode
-        original_mode = self.model.training
-        self.model.eval()
-        
-        try:
-            for i in range(min(max_samples, len(eval_dataset))):
-                try:
-                    sample = eval_dataset[i]
-                    
-                    # Generate prediction
-                    pred_html = self.generate_prediction(sample)
-                    
-                    # Get ground truth
-                    if 'messages' in sample and len(sample['messages']) > 1:
-                        true_html = sample['messages'][1]['content']
-                    else:
-                        true_html = sample.get('html_table', '')
-                    
-                    # Validate HTML content
-                    if not pred_html.strip():
-                        self.logger.warning(f"Sample {i+1}: Empty prediction")
-                        continue
-                    
-                    if not true_html.strip():
-                        self.logger.warning(f"Sample {i+1}: Empty ground truth")
-                        continue
-                    
-                    # Calculate TEDS scores with error handling
-                    try:
-                        teds_sc = self.teds_structure_content(true_html, pred_html)
-                        teds_so = self.teds_structure_only(true_html, pred_html)
-                        
-                        # Validate scores
-                        if not (0.0 <= teds_sc <= 1.0) or not (0.0 <= teds_so <= 1.0):
-                            self.logger.warning(f"Sample {i+1}: Invalid TEDS scores - SC: {teds_sc}, SO: {teds_so}")
-                            continue
-                        
-                        structure_content_scores.append(teds_sc)
-                        structure_only_scores.append(teds_so)
-                        successful += 1
-                        
-                        self.logger.info(f"Sample {i+1} TEDS - Structure+Content: {teds_sc:.4f}, Structure: {teds_so:.4f}")
-                        
-                    except Exception as teds_error:
-                        self.logger.warning(f"Sample {i+1}: TEDS calculation error: {teds_error}")
-                        continue
+        for i in range(min(max_samples, len(eval_dataset))):
+            try:
+                sample = eval_dataset[i]
+                pred_html = self.generate_prediction(sample)
                 
-                except Exception as e:
-                    self.logger.warning(f"Sample {i+1}: Processing error: {e}")
+                # Get ground truth
+                true_html = (sample['messages'][1]['content'] if 'messages' in sample and len(sample['messages']) > 1 
+                           else sample.get('html_table', ''))
+                
+                if not pred_html.strip() or not true_html.strip():
+                    self.logger.warning(f"Sample {i+1}: Empty HTML (pred: {len(pred_html)}, true: {len(true_html)})")
                     continue
-            
-            # Calculate averages
-            avg_sc = np.mean(structure_content_scores) if structure_content_scores else 0.0
-            avg_so = np.mean(structure_only_scores) if structure_only_scores else 0.0
-            
-            self.logger.info(f"TEDS RESULTS: {successful}/{max_samples} samples evaluated successfully")
-            self.logger.info(f"Average TEDS - Structure+Content: {avg_sc:.4f} | Structure-only: {avg_so:.4f}")
-            
-            return {
-                'eval_teds_structure_content': avg_sc,
-                'eval_teds_structure_only': avg_so,
-                'eval_teds_samples': successful
-            }
-            
-        finally:
-            # Restore original training mode
-            self.model.train(original_mode)
-            
-            # Final cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                
+                # Calculate TEDS scores
+                teds_sc = self.teds_structure_content(true_html, pred_html)
+                teds_so = self.teds_structure_only(true_html, pred_html)
+                
+                structure_content_scores.append(teds_sc)
+                structure_only_scores.append(teds_so)
+                successful += 1
+                
+                self.logger.info(f"Sample {i+1} TEDS - Structure+Content: {teds_sc:.4f}, Structure: {teds_so:.4f}")
+                
+            except Exception as e:
+                self.logger.warning(f"Sample {i+1}: Error: {e}")
+        
+        # Calculate averages
+        avg_sc = np.mean(structure_content_scores) if structure_content_scores else 0.0
+        avg_so = np.mean(structure_only_scores) if structure_only_scores else 0.0
+        
+        self.logger.info(f"TEDS RESULTS: {successful}/{max_samples} samples | Structure+Content: {avg_sc:.4f} | Structure: {avg_so:.4f}")
+        
+        return {'eval_teds_structure_content': avg_sc, 'eval_teds_structure_only': avg_so, 'eval_teds_samples': successful}
 
 
 class ResourceCallback(TrainerCallback):
@@ -262,30 +369,58 @@ class ResourceCallback(TrainerCallback):
         if not self.teds_evaluator or not self.eval_dataset:
             return
             
-        # Only evaluate after sufficient training
         if state.global_step >= 50:
             try:
-                self.logger.info(f"Running TEDS evaluation at step {state.global_step}")
+                teds_results = self.teds_evaluator.evaluate_samples(self.eval_dataset, 3)
+                self.logger.info(f"[Step {state.global_step}] TEDS: {teds_results['eval_teds_structure_content']:.4f} (SC) | "
+                               f"{teds_results['eval_teds_structure_only']:.4f} (SO) | {teds_results['eval_teds_samples']} samples")
                 
-                # Run TEDS evaluation
-                teds_results = self.teds_evaluator.evaluate_samples(self.eval_dataset, 5)  # Increased to 5 samples
-                
-                # Log results
-                self.logger.info(f"[Step {state.global_step}] TEDS Results:")
-                self.logger.info(f"  Structure+Content: {teds_results['eval_teds_structure_content']:.4f}")
-                self.logger.info(f"  Structure-only: {teds_results['eval_teds_structure_only']:.4f}")
-                self.logger.info(f"  Successful samples: {teds_results['eval_teds_samples']}")
-                
-                # Add to logs for tensorboard
-                if logs is not None:
-                    logs.update(teds_results)
-                    
+                # Log to tensorboard
+                if hasattr(state, 'log_history'):
+                    state.log_history[-1].update(teds_results)
             except Exception as e:
-                self.logger.error(f"TEDS evaluation failed at step {state.global_step}: {e}")
-                import traceback
-                self.logger.error(traceback.format_exc())
+                self.logger.error(f"TEDS evaluation failed: {e}")
         else:
-            self.logger.info(f"[Step {state.global_step}] Skipping TEDS evaluation - waiting for step 50+")
+            self.logger.info(f"[Step {state.global_step}] Skipping TEDS - waiting for step 50+")
+
+
+class MemoryCallback(TrainerCallback):
+    """Memory-aware training callback with automatic cleanup"""
+    def __init__(self, logger, memory_threshold=0.85):
+        self.logger = logger
+        self.memory_threshold = memory_threshold
+        self.last_memory_check = 0
+        
+    def on_step_end(self, args, state, control, **kwargs):
+        # Only check memory every 25 steps to reduce overhead
+        if state.global_step % 25 == 0 and state.global_step != self.last_memory_check:
+            self.last_memory_check = state.global_step
+            
+            memory_warnings = []
+            cleanup_needed = False
+            
+            for i in range(torch.cuda.device_count()):
+                gpu_info = get_gpu_info(i)
+                if gpu_info is None:
+                    continue
+                    
+                usage_pct = gpu_info['allocated'] / gpu_info['total']
+                
+                if usage_pct > self.memory_threshold:
+                    memory_warnings.append(f"GPU {i}: {usage_pct:.1%}")
+                    cleanup_needed = True
+            
+            if cleanup_needed:
+                self.logger.warning(f"High memory usage detected: {', '.join(memory_warnings)}")
+                
+                # Trigger cleanup
+                gc.collect()
+                torch.cuda.empty_cache()
+                self.logger.info("Performed memory cleanup (gc + cache clear)")
+            
+            # Detailed breakdown every 100 steps (less frequent than before)
+            if state.global_step % 100 == 0:
+                log_memory_breakdown(self.logger, f"Step-{state.global_step}")
 
 
 def main():
@@ -294,23 +429,24 @@ def main():
     seed_everything(42)
     
     # Configuration
-    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
+    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
     output_dir = 'output'
     
-    # Calculate training parameters
+    # Calculate training parameters with smart GPU scaling
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    gradient_accumulation_steps = max(4 // gpu_count, 1)
-    total_samples, epochs = 222, 6
-    expected_steps = (total_samples * epochs) // (1 * gradient_accumulation_steps * gpu_count)
+    per_device_batch, gradient_accumulation_steps, effective_batch = calculate_training_params(gpu_count, logger)
     
-    logger.info(f"Training setup: {gpu_count} GPUs, grad_accum={gradient_accumulation_steps}, expected_steps={expected_steps}")
+    total_samples, epochs = 222, 6
+    expected_steps = (total_samples * epochs) // effective_batch
+    
+    logger.info(f"Training setup: {gpu_count} GPUs, effective_batch={effective_batch}, expected_steps={expected_steps}")
     
     # Training arguments
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=1e-4,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
+        per_device_train_batch_size=per_device_batch,
+        per_device_eval_batch_size=per_device_batch,
         gradient_checkpointing=True,
         weight_decay=0.1,
         lr_scheduler_type='cosine',
@@ -357,10 +493,24 @@ def main():
     logger.info(f'Model: {get_model_parameter_info(model)}')
     
     # Load and process dataset
-    logger.info("Loading dataset...") 
-    raw_dataset = hf_load_dataset("apoidea/pubtabnet-html") # ruilin808/dataset_1920x1280
-    train_processed = raw_dataset['train'].map(create_swift_format_single)
-    val_processed = raw_dataset['validation'].map(create_swift_format_single)
+    logger.info("Loading dataset...")
+    raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
+    
+    # Filter out samples with HTML longer than 15,000 characters
+    def filter_long_html(sample):
+        """Filter function to remove samples with long HTML"""
+        html_content = sample.get('html_table', '')
+        return len(html_content) <= 15000
+    
+    logger.info("Filtering long HTML samples...")
+    train_filtered = raw_dataset['train'].filter(filter_long_html)
+    val_filtered = raw_dataset['validation'].filter(filter_long_html)
+    
+    logger.info(f"Original dataset: {len(raw_dataset['train'])} train, {len(raw_dataset['validation'])} validation")
+    logger.info(f"Filtered dataset: {len(train_filtered)} train, {len(val_filtered)} validation samples")
+    
+    train_processed = train_filtered.map(create_swift_format_single)
+    val_processed = val_filtered.map(create_swift_format_single)
     
     train_dataset = LazyLLMDataset(train_processed, template.encode, random_state=42)
     val_dataset = LazyLLMDataset(val_processed, template.encode, random_state=42)
@@ -384,7 +534,10 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
-        callbacks=[ResourceCallback(logger, teds_evaluator, val_processed)],
+        callbacks=[
+            ResourceCallback(logger, teds_evaluator, val_processed),
+            MemoryCallback(logger, memory_threshold=0.85)
+        ],
     )
     
     trainer.train()
