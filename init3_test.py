@@ -1,3 +1,19 @@
+# Required imports for the improvements
+import torch
+import torch.distributed
+import numpy as np
+import time
+from transformers import TrainerCallback
+
+# TEDS import
+try:
+    from table_recognition_metric import TEDS
+    print("TEDS library loaded successfully")
+except ImportError:
+    print("TEDS library not found. Install with: pip install table-recognition-metric")
+    raise
+
+
 class TEDSEvaluator:
     """Improved TEDS evaluator with better multi-GPU support"""
     
