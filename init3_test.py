@@ -202,9 +202,12 @@ def main():
     model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
     output_dir = 'output'
     
+    # Set PyTorch memory management
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     # Calculate training parameters
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    gradient_accumulation_steps = max(4 // gpu_count, 1)
+    gradient_accumulation_steps = 4  # Increased from max(4 // gpu_count, 1)
     total_samples, epochs = 222, 6
     expected_steps = (total_samples * epochs) // (1 * gradient_accumulation_steps * gpu_count)
     
@@ -248,7 +251,7 @@ def main():
     # Load model and setup
     logger.info("Loading model...")
     model, processor = get_model_tokenizer(model_id_or_path)
-    template = get_template(model.model_meta.template, processor, max_length=32768)
+    template = get_template(model.model_meta.template, processor, max_length=8192)  # Reduced from 32768
     template.set_mode('train')
     if template.use_model:
         template.model = model
