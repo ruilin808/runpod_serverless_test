@@ -35,7 +35,7 @@ def create_swift_format_single(sample):
     """Convert single sample to Swift format with length filtering"""
     html_length = len(sample['html_table'])
     # Filter out extremely long samples (>80K characters ~ 20K tokens)
-    if html_length > 80000:
+    if html_length > 30000:
         return None  # Skip this sample
     
     return {
