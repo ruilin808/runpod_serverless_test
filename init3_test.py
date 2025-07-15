@@ -32,7 +32,12 @@ from transformers import TrainerCallback
 
 
 def create_swift_format_single(sample):
-    """Convert single sample to Swift format"""
+    """Convert single sample to Swift format with length filtering"""
+    html_length = len(sample['html_table'])
+    # Filter out extremely long samples (>80K characters ~ 20K tokens)
+    if html_length > 80000:
+        return None  # Skip this sample
+    
     return {
         'messages': [
             {'role': 'user', 'content': 'Write the HTML representation for this image of a medical table.'},
@@ -207,7 +212,7 @@ def main():
     
     # Calculate training parameters
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    gradient_accumulation_steps = 4  # Increased from max(4 // gpu_count, 1)
+    gradient_accumulation_steps = 2  # Reduced from 4 for less memory usage during backward pass
     total_samples, epochs = 222, 6
     expected_steps = (total_samples * epochs) // (1 * gradient_accumulation_steps * gpu_count)
     
@@ -244,6 +249,7 @@ def main():
         max_grad_norm=1.0,
         dataloader_drop_last=True,
         ddp_find_unused_parameters=False,
+        dataloader_pin_memory=False,  # CPU offloading optimization
     )
     
     log_resources(logger, "START")
@@ -251,7 +257,7 @@ def main():
     # Load model and setup
     logger.info("Loading model...")
     model, processor = get_model_tokenizer(model_id_or_path)
-    template = get_template(model.model_meta.template, processor, max_length=32768)  # Reduced from 32768
+    template = get_template(model.model_meta.template, processor, max_length=24576)  # Increased to accommodate longer HTML tables
     template.set_mode('train')
     if template.use_model:
         template.model = model
@@ -259,7 +265,7 @@ def main():
     # Setup LoRA
     logger.info("Setting up LoRA...")
     target_modules = get_multimodal_target_regex(model, freeze_llm=False, freeze_vit=True, freeze_aligner=True)
-    lora_config = LoraConfig(task_type='CAUSAL_LM', r=4, lora_alpha=16, target_modules=target_modules)
+    lora_config = LoraConfig(task_type='CAUSAL_LM', r=2, lora_alpha=8, target_modules=target_modules)  # Reduced rank and alpha for less memory usage
     model = Swift.prepare_model(model, lora_config)
     
     logger.info(f'Model: {get_model_parameter_info(model)}')
@@ -267,13 +273,18 @@ def main():
     # Load and process dataset
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
+    
+    # Filter out None samples from length filtering
     train_processed = raw_dataset['train'].map(create_swift_format_single)
+    train_processed = train_processed.filter(lambda x: x is not None)
+    
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
+    val_processed = val_processed.filter(lambda x: x is not None)
     
     train_dataset = LazyLLMDataset(train_processed, template.encode, random_state=42)
     val_dataset = LazyLLMDataset(val_processed, template.encode, random_state=42)
     
-    logger.info(f"Dataset: {len(train_dataset)} train, {len(val_dataset)} validation samples")
+    logger.info(f"Dataset: {len(train_dataset)} train, {len(val_dataset)} validation samples (after filtering)")
     
     # Initialize TEDS evaluator - COMMENTED OUT
     # teds_evaluator = TEDSEvaluator(model, processor, template, logger)
