@@ -357,8 +357,8 @@ def main():
     logger.info(f'Model: {get_model_parameter_info(model)}')
     
     # Load and process dataset
-    logger.info("Loading dataset...")
-    raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
+    logger.info("Loading dataset...") 
+    raw_dataset = hf_load_dataset("apoidea/pubtabnet-html") # ruilin808/dataset_1920x1280
     train_processed = raw_dataset['train'].map(create_swift_format_single)
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
