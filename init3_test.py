@@ -251,7 +251,7 @@ def main():
     # Load model and setup
     logger.info("Loading model...")
     model, processor = get_model_tokenizer(model_id_or_path)
-    template = get_template(model.model_meta.template, processor, max_length=20000)  # Reduced from 32768
+    template = get_template(model.model_meta.template, processor, max_length=32768)  # Reduced from 32768
     template.set_mode('train')
     if template.use_model:
         template.model = model
