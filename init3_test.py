@@ -212,7 +212,7 @@ def main():
     
     # Calculate training parameters
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    gradient_accumulation_steps = 2  # Reduced from 4 for less memory usage during backward pass
+    gradient_accumulation_steps = 1  # Reduced from 4 for less memory usage during backward pass
     total_samples, epochs = 222, 6
     expected_steps = (total_samples * epochs) // (1 * gradient_accumulation_steps * gpu_count)
     
