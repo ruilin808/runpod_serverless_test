@@ -229,7 +229,7 @@ def main():
         gc.collect()
     
     # Configuration - Use workspace paths
-    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'  # Will use cached version
+    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'  # Will use cached version
     output_dir = '/workspace/output'  # Save to workspace
     data_seed = 42
     
