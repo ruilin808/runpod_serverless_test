@@ -1,10 +1,67 @@
 #!/usr/bin/env python3
 """
-Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
+Memory-Optimized Qwen2-VL Fine-tuning Script for RunPod with /workspace storage
 """
 
 import os
 import torch
+import gc
+import json
+import re
+import shutil
+from multiprocessing import Pool, cpu_count
+from typing import List, Dict, Any
+from pathlib import Path
+
+# FIRST: Setup RunPod workspace before any other imports
+def setup_runpod_workspace():
+    """Setup RunPod workspace directories and environment variables"""
+    print("Setting up RunPod workspace...")
+    
+    # Create necessary directories in /workspace
+    workspace_dirs = [
+        "/workspace/cache",
+        "/workspace/cache/huggingface",
+        "/workspace/cache/modelscope", 
+        "/workspace/cache/datasets",
+        "/workspace/models",
+        "/workspace/datasets",
+        "/workspace/output"
+    ]
+    
+    for directory in workspace_dirs:
+        os.makedirs(directory, exist_ok=True)
+    
+    # Set environment variables BEFORE importing other libraries
+    os.environ['HF_HOME'] = '/workspace/cache/huggingface'
+    os.environ['TRANSFORMERS_CACHE'] = '/workspace/cache/huggingface/transformers'
+    os.environ['HF_DATASETS_CACHE'] = '/workspace/cache/datasets'
+    os.environ['HUGGINGFACE_HUB_CACHE'] = '/workspace/cache/huggingface/hub'
+    os.environ['MODELSCOPE_CACHE'] = '/workspace/cache/modelscope'
+    os.environ['TORCH_HOME'] = '/workspace/cache/torch'
+    
+    # Create symbolic links from default cache locations
+    default_hf_cache = os.path.expanduser('~/.cache/huggingface')
+    default_modelscope_cache = os.path.expanduser('~/.cache/modelscope')
+    
+    # Remove existing and create symlinks
+    for default_cache, workspace_cache in [
+        (default_hf_cache, '/workspace/cache/huggingface'),
+        (default_modelscope_cache, '/workspace/cache/modelscope')
+    ]:
+        if os.path.exists(default_cache) and not os.path.islink(default_cache):
+            shutil.rmtree(default_cache, ignore_errors=True)
+        
+        os.makedirs(os.path.dirname(default_cache), exist_ok=True)
+        
+        if not os.path.exists(default_cache):
+            os.symlink(workspace_cache, default_cache)
+            print(f"Created symlink: {default_cache} -> {workspace_cache}")
+    
+    print("RunPod workspace setup complete!")
+
+# Setup workspace FIRST
+setup_runpod_workspace()
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -12,6 +69,9 @@ def setup_gpus():
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print(f"Detected {gpu_count} GPU(s)")
+        
+        # Set memory management for better allocation
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         
         if gpu_count > 1:
             # Use all available GPUs
@@ -28,9 +88,10 @@ def setup_gpus():
         print("No CUDA GPUs available")
         return 0
 
-# Setup GPUs before importing other modules
+# Setup GPUs after workspace setup
 gpu_count = setup_gpus()
 
+# Now import other modules
 from swift.llm import (
     get_model_tokenizer, get_template,
     get_multimodal_target_regex, LazyLLMDataset
@@ -38,194 +99,161 @@ from swift.llm import (
 from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_everything
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import TrainerCallback
 from datasets import load_dataset as hf_load_dataset
 
+# TEDS evaluation imports
+try:
+    from table_recognition_metric import TEDS
+    TEDS_AVAILABLE = True
+    print("TEDS evaluation enabled")
+except ImportError:
+    TEDS_AVAILABLE = False
+    print("WARNING: table_recognition_metric not installed. TEDS evaluation disabled.")
 
-def create_swift_format_single(sample):
-    """Convert single sample to Swift format"""
-    return {
-        'messages': [
-            {
-                'role': 'user',
-                'content': 'Write the HTML representation for this image of a medical table.'
-            },
-            {
-                'role': 'assistant',
-                'content': sample['html_table']
-            }
-        ],
-        'images': [sample['image']]
-    }
-
-
-def filter_by_length(dataset, template, max_length):
-    """Filter out samples that exceed max_length after encoding"""
-    def is_valid_length(sample):
+def download_to_workspace():
+    """Download model and dataset to workspace if not already present"""
+    model_id = 'Qwen/Qwen2.5-VL-32B-Instruct'
+    dataset_name = "ruilin808/dataset_1920x1280"
+    
+    # Check if model exists in workspace
+    model_workspace_path = f'/workspace/cache/modelscope/hub/models/{model_id}'
+    if not os.path.exists(model_workspace_path):
+        print(f"Downloading {model_id} to workspace...")
+        
+        # Import here to ensure environment variables are set
+        from modelscope import snapshot_download
+        
         try:
-            encoded = template.encode(sample)
-            return len(encoded['input_ids']) <= max_length
-        except Exception:
-            return False
+            snapshot_download(
+                model_id, 
+                cache_dir='/workspace/cache/modelscope'
+            )
+            print(f"Model downloaded to workspace cache")
+        except Exception as e:
+            print(f"Error downloading model: {e}")
+    else:
+        print(f"Model already exists in workspace: {model_workspace_path}")
     
-    return dataset.filter(is_valid_length)
+    # Check if dataset exists
+    dataset_cache_path = f'/workspace/cache/datasets/{dataset_name.replace("/", "_")}'
+    if not os.path.exists(dataset_cache_path):
+        print(f"Downloading {dataset_name} to workspace...")
+        
+        try:
+            # This will use the HF_DATASETS_CACHE we set to /workspace/cache/datasets
+            dataset = hf_load_dataset(dataset_name)
+            print(f"Dataset cached to workspace")
+        except Exception as e:
+            print(f"Error downloading dataset: {e}")
+    else:
+        print(f"Dataset already exists in workspace cache")
 
+def check_workspace_storage():
+    """Check available storage in workspace"""
+    try:
+        stat = shutil.disk_usage('/workspace')
+        total_gb = stat.total / (1024**3)
+        used_gb = stat.used / (1024**3) 
+        free_gb = stat.free / (1024**3)
+        
+        print(f"\nWorkspace Storage Status:")
+        print(f"  Total: {total_gb:.1f} GB")
+        print(f"  Used:  {used_gb:.1f} GB") 
+        print(f"  Free:  {free_gb:.1f} GB")
+        print(f"  Usage: {(used_gb/total_gb)*100:.1f}%")
+        
+        if free_gb < 50:
+            print("⚠️  WARNING: Low disk space!")
+        
+        return free_gb > 50
+    except Exception as e:
+        print(f"Error checking storage: {e}")
+        return True
 
-def truncate_html_content(sample, max_html_chars=8000):
-    """Truncate HTML content if it's too long"""
-    if len(sample['html_table']) > max_html_chars:
-        sample['html_table'] = sample['html_table'][:max_html_chars] + "..."
-    return sample
+# [Keep all your existing functions like normalize_html_for_teds, evaluate_single_teds, etc.]
+# ... (paste your existing helper functions here)
 
-
-def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_effective_batch_size=32):
-    """Calculate optimal batch size and gradient accumulation steps for multi-GPU setup"""
-    if gpu_count <= 1:
-        return base_batch_size, target_effective_batch_size // base_batch_size
+# Fixed TEDSEvaluationCallback (using the fixed version from previous artifact)
+class TEDSEvaluationCallback(TrainerCallback):
+    """Custom callback to compute TEDS scores during training"""
     
-    # For multi-GPU, we can increase per-device batch size slightly
-    # but keep it conservative for memory constraints
-    per_device_batch_size = min(base_batch_size * 2, 4)  # Max 4 to avoid OOM
+    def __init__(self, template, eval_dataset, eval_frequency=100, gpu_count=1):
+        super().__init__()
+        self.template = template
+        self.eval_dataset = eval_dataset
+        self.eval_frequency = eval_frequency
+        self.gpu_count = gpu_count
+        self.step_count = 0
+        self.eval_count = 0
+        self.teds_history = []
+        
+        # Scale sample sizes based on GPU count
+        if gpu_count >= 8:
+            self.quick_sample_size = min(50, len(eval_dataset))
+            self.thorough_sample_size = min(150, len(eval_dataset))
+        elif gpu_count >= 4:
+            self.quick_sample_size = min(30, len(eval_dataset))
+            self.thorough_sample_size = min(100, len(eval_dataset))
+        else:
+            self.quick_sample_size = min(20, len(eval_dataset))
+            self.thorough_sample_size = min(75, len(eval_dataset))
+        
+        print(f"TEDS Evaluation Configuration:")
+        print(f"  - Quick evaluation: {self.quick_sample_size} samples")
+        print(f"  - Thorough evaluation: {self.thorough_sample_size} samples (every 5th evaluation)")
     
-    # Calculate gradient accumulation to maintain effective batch size
-    total_batch_size_per_step = per_device_batch_size * gpu_count
-    gradient_accumulation_steps = max(1, target_effective_batch_size // total_batch_size_per_step)
+    def on_init_end(self, args, state, control, **kwargs):
+        """Called at the end of trainer initialization"""
+        print("TEDS Evaluation Callback initialized successfully")
+        return control
     
-    return per_device_batch_size, gradient_accumulation_steps
-
+    # [Include the rest of the fixed callback methods from the previous artifact]
 
 def main():
-    """Main training function"""
+    """Main training function with RunPod workspace integration"""
     
     logger = get_logger()
     seed_everything(42)
     
-    # Configuration - Increased max_length to accommodate longer sequences
-    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
-    output_dir = 'output'
+    # Check workspace storage first
+    if not check_workspace_storage():
+        logger.warning("Proceeding with low disk space - monitor usage carefully!")
+    
+    # Download model and dataset to workspace
+    download_to_workspace()
+    
+    # Clear initial GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Configuration - Use workspace paths
+    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'  # Will use cached version
+    output_dir = '/workspace/output'  # Save to workspace
     data_seed = 42
-    max_length = 20480  # Increased from 16384
     
-    # LoRA configuration
-    lora_rank = 8
-    lora_alpha = 32
-    freeze_llm = False
-    freeze_vit = True
-    freeze_aligner = True
+    # [Keep all your existing configuration and scaling logic]
+    # ... (paste your existing configuration code here)
     
-    # Calculate optimal batch size and gradient accumulation for available GPUs
-    per_device_batch_size, gradient_accumulation_steps = calculate_batch_size_and_accumulation(
-        gpu_count, base_batch_size=1, target_effective_batch_size=32
+    # Load model - will use workspace cache
+    logger.info("Loading model from workspace cache...")
+    model, processor = get_model_tokenizer(
+        model_id_or_path,  # This will now use the cached version
+        torch_dtype=torch.float16,
+        device_map='auto',
+        low_cpu_mem_usage=True,
     )
     
-    logger.info(f"Multi-GPU Configuration:")
-    logger.info(f"  - GPUs available: {gpu_count}")
-    logger.info(f"  - Per-device batch size: {per_device_batch_size}")
-    logger.info(f"  - Gradient accumulation steps: {gradient_accumulation_steps}")
-    logger.info(f"  - Effective batch size: {per_device_batch_size * gpu_count * gradient_accumulation_steps}")
+    # [Continue with rest of your existing main() function]
+    # ... (paste the rest of your training code here)
     
-    # Training arguments - Adjusted for multi-GPU
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=output_dir,
-        learning_rate=1e-4,
-        per_device_train_batch_size=per_device_batch_size,
-        per_device_eval_batch_size=per_device_batch_size,
-        gradient_checkpointing=True,
-        weight_decay=0.1,
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.05,
-        report_to=['tensorboard'],
-        logging_first_step=True,
-        save_strategy='steps',
-        save_steps=50,
-        eval_strategy='steps',
-        eval_steps=50,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        num_train_epochs=3,
-        metric_for_best_model='loss',
-        save_total_limit=5,
-        logging_steps=5,
-        dataloader_num_workers=4 * gpu_count,  # Scale workers with GPU count
-        data_seed=data_seed,
-        remove_unused_columns=False,
-        max_grad_norm=1.0,  # Added gradient clipping
-        # Multi-GPU specific settings
-        dataloader_pin_memory=True,
-        ddp_find_unused_parameters=False,  # Can help with performance
-        ddp_timeout=1800,  # 30 minutes timeout for DDP
-    )
+    # At the end, show final workspace usage
+    print("\n" + "=" * 50)
+    print("Final workspace storage status:")
+    check_workspace_storage()
     
-    # Load model and setup template
-    model, processor = get_model_tokenizer(model_id_or_path)
-    template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
-    template.set_mode('train')
-    template.model = model
-    
-    # Setup LoRA
-    target_modules = get_multimodal_target_regex(model, freeze_llm=freeze_llm, freeze_vit=freeze_vit, 
-                                freeze_aligner=freeze_aligner)
-    lora_config = LoraConfig(task_type='CAUSAL_LM', r=lora_rank, lora_alpha=lora_alpha,
-                             target_modules=target_modules)
-    model = Swift.prepare_model(model, lora_config)
-    
-    model_parameter_info = get_model_parameter_info(model)
-    logger.info(f'model_parameter_info: {model_parameter_info}')
-    
-    # Load and process dataset
-    logger.info("Loading dataset...")
-    raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
-    
-    # Apply HTML truncation first (optional - use if you want to truncate rather than filter)
-    # train_processed = raw_dataset['train'].map(truncate_html_content)
-    # val_processed = raw_dataset['validation'].map(truncate_html_content)
-    
-    # Convert to Swift format
-    train_processed = raw_dataset['train'].map(create_swift_format_single)
-    val_processed = raw_dataset['validation'].map(create_swift_format_single)
-    
-    logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
-    
-    # Filter out samples that are too long
-    logger.info("Filtering samples by length...")
-    train_processed = filter_by_length(train_processed, template, max_length)
-    val_processed = filter_by_length(val_processed, template, max_length)
-    
-    logger.info(f"Filtered dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
-    
-    # Convert to LazyLLMDataset
-    train_dataset = LazyLLMDataset(train_processed, template.encode, random_state=data_seed)
-    val_dataset = LazyLLMDataset(val_processed, template.encode, random_state=data_seed)
-    
-    logger.info(f"Final dataset sizes - Training: {len(train_dataset)}, Validation: {len(val_dataset)} samples")
-    
-    # Check if we have enough data after filtering
-    if len(train_dataset) == 0:
-        logger.error("No training samples remain after filtering! Consider increasing max_length or truncating HTML content.")
-        return
-    
-    # Train
-    model.enable_input_require_grads()
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        data_collator=template.data_collator,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        template=template,
-    )
-    
-    try:
-        trainer.train()
-    except Exception as e:
-        logger.error(f"Training failed: {e}")
-        return
-    
-    # Save visualization
-    visual_loss_dir = os.path.join(os.path.abspath(output_dir), 'visual_loss')
-    os.makedirs(visual_loss_dir, exist_ok=True)
-    plot_images(visual_loss_dir, training_args.logging_dir, ['train/loss'], 0.9)
-    
-    logger.info(f'Training complete. Model saved to: {trainer.state.last_model_checkpoint}')
-
+    logger.info(f'Training complete. Model saved to: {output_dir}')
 
 if __name__ == "__main__":
     main()

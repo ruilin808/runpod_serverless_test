@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
+NO TEDS WORKING!!!!!!!!
 """
 
 import os

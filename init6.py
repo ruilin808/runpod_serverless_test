@@ -10,6 +10,7 @@ import json
 import re
 from multiprocessing import Pool, cpu_count
 from typing import List, Dict, Any
+from transformers import TrainerCallback
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -157,10 +158,11 @@ def evaluate_teds_parallel(predictions: List[str], ground_truths: List[str]) -> 
         return {"teds_score": 0.0, "teds_count": 0}
 
 # NEW: Custom callback for TEDS evaluation during training
-class TEDSEvaluationCallback:
+class TEDSEvaluationCallback(TrainerCallback):
     """Custom callback to compute TEDS scores during training"""
     
     def __init__(self, template, eval_dataset, eval_frequency=100, gpu_count=1):
+        super().__init__()
         self.template = template
         self.eval_dataset = eval_dataset
         self.eval_frequency = eval_frequency
@@ -183,11 +185,16 @@ class TEDSEvaluationCallback:
         print(f"TEDS Evaluation Configuration:")
         print(f"  - Quick evaluation: {self.quick_sample_size} samples")
         print(f"  - Thorough evaluation: {self.thorough_sample_size} samples (every 5th evaluation)")
-        
-    def on_evaluate(self, logs: Dict[str, Any]) -> Dict[str, Any]:
+    
+    def on_init_end(self, args, state, control, **kwargs):
+        """Called at the end of trainer initialization"""
+        print("TEDS Evaluation Callback initialized successfully")
+        return control
+    
+    def on_evaluate(self, args, state, control, logs=None, **kwargs):
         """Called during evaluation to compute TEDS scores"""
-        if not TEDS_AVAILABLE:
-            return logs
+        if not TEDS_AVAILABLE or logs is None:
+            return control
         
         try:
             self.eval_count += 1
@@ -210,11 +217,24 @@ class TEDSEvaluationCallback:
                     sample = self.eval_dataset[idx]
                     
                     # Extract ground truth HTML
-                    if 'messages' in sample:
+                    if hasattr(sample, 'get') and 'messages' in sample:
                         for message in sample['messages']:
-                            if message['role'] == 'assistant':
-                                ground_truths.append(message['content'])
+                            if message.get('role') == 'assistant':
+                                ground_truths.append(message.get('content', ''))
                                 break
+                    elif hasattr(sample, '__getitem__'):
+                        # Handle different dataset formats
+                        try:
+                            if 'html_table' in sample:
+                                ground_truths.append(sample['html_table'])
+                            elif 'target' in sample:
+                                ground_truths.append(sample['target'])
+                            else:
+                                ground_truths.append('')
+                        except:
+                            ground_truths.append('')
+                    else:
+                        ground_truths.append('')
                     
                     # Generate prediction (simplified - in real implementation you'd use the model)
                     # This is a placeholder - actual implementation would generate from model
@@ -225,11 +245,12 @@ class TEDSEvaluationCallback:
             teds_results = evaluate_teds_parallel(predictions, ground_truths)
             
             # Add TEDS results to logs
-            logs.update(teds_results)
+            if logs is not None:
+                logs.update(teds_results)
             
             # Store history with evaluation type
             self.teds_history.append({
-                'step': self.step_count,
+                'step': state.global_step,
                 'eval_count': self.eval_count,
                 'teds_score': teds_results.get('teds_score', 0.0),
                 'sample_size': eval_sample_size,
@@ -241,14 +262,15 @@ class TEDSEvaluationCallback:
             
         except Exception as e:
             print(f"Error in TEDS evaluation: {e}")
-            logs['teds_score'] = 0.0
+            if logs is not None:
+                logs['teds_score'] = 0.0
         
-        return logs
+        return control
     
-    def on_log(self, logs: Dict[str, Any]) -> Dict[str, Any]:
+    def on_log(self, args, state, control, logs=None, **kwargs):
         """Called on each logging step"""
-        self.step_count += 1
-        return logs
+        self.step_count = state.global_step
+        return control
 
 def create_swift_format_single(sample):
     """Convert single sample to Swift format"""
