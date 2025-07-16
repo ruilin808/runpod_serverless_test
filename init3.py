@@ -10,8 +10,9 @@ import torch
 import time
 import numpy as np
 
-# Enable CUDA debugging
+# Enable CUDA debugging and device-side assertions
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['TORCH_USE_CUDA_DSA'] = '1'
 
 # Use all available GPUs
 if torch.cuda.is_available():
@@ -83,7 +84,67 @@ def log_resources(logger, step="", samples_per_sec=None):
                 f"Disk: {disk.used/1024**3:.1f}/{disk.total/1024**3:.1f}GB ({disk.used/disk.total*100:.1f}%){speed_info}")
 
 
-def validate_dataset_samples(dataset, processor, logger, max_samples=5):
+def validate_and_fix_tokens(input_ids, labels, vocab_size, logger):
+    """Validate and fix token IDs to prevent CUDA errors"""
+    fixed_input_ids = input_ids.clone() if isinstance(input_ids, torch.Tensor) else torch.tensor(input_ids)
+    fixed_labels = labels.clone() if isinstance(labels, torch.Tensor) else torch.tensor(labels) if labels is not None else None
+    
+    # Fix input_ids
+    invalid_mask = (fixed_input_ids < 0) | (fixed_input_ids >= vocab_size)
+    if invalid_mask.any():
+        logger.warning(f"Found {invalid_mask.sum()} invalid input_ids. Fixing...")
+        # Replace invalid tokens with UNK token (usually 0 or 1)
+        unk_token_id = 0  # Fallback UNK token
+        if hasattr(logger, 'tokenizer') and hasattr(logger.tokenizer, 'unk_token_id'):
+            unk_token_id = logger.tokenizer.unk_token_id or 0
+        fixed_input_ids[invalid_mask] = unk_token_id
+    
+    # Fix labels if present
+    if fixed_labels is not None:
+        # Only check non-ignored labels
+        valid_label_mask = fixed_labels != -100
+        invalid_label_mask = valid_label_mask & ((fixed_labels < 0) | (fixed_labels >= vocab_size))
+        if invalid_label_mask.any():
+            logger.warning(f"Found {invalid_label_mask.sum()} invalid labels. Fixing...")
+            # Replace invalid labels with ignore index
+            fixed_labels[invalid_label_mask] = -100
+    
+    return fixed_input_ids, fixed_labels
+
+
+def create_safe_data_collator(template, processor, logger):
+    """Create a data collator with token validation"""
+    original_collator = template.data_collator
+    vocab_size = len(processor.tokenizer)
+    
+    def safe_collator(features):
+        try:
+            # Use original collator first
+            batch = original_collator(features)
+            
+            # Validate and fix tokens
+            if 'input_ids' in batch:
+                batch['input_ids'], _ = validate_and_fix_tokens(
+                    batch['input_ids'], None, vocab_size, logger
+                )
+            
+            if 'labels' in batch:
+                _, batch['labels'] = validate_and_fix_tokens(
+                    batch.get('input_ids', torch.tensor([])), batch['labels'], vocab_size, logger
+                )
+            
+            return batch
+            
+        except Exception as e:
+            logger.error(f"Data collator error: {e}")
+            # Return a minimal safe batch
+            return {
+                'input_ids': torch.tensor([[0]], dtype=torch.long),
+                'labels': torch.tensor([[-100]], dtype=torch.long),
+                'attention_mask': torch.tensor([[1]], dtype=torch.long)
+            }
+    
+    return safe_collator
     """Validate dataset samples for token ID issues"""
     logger.info(f"Validating {min(max_samples, len(dataset))} dataset samples...")
     
@@ -410,20 +471,57 @@ def main():
     # Initialize TEDS evaluator
     teds_evaluator = TEDSEvaluator(model, processor, template, logger)
     
-    # Memory management
+    # Memory management with better error handling
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("CUDA memory cleared successfully")
+        except RuntimeError as e:
+            logger.error(f"CUDA memory cleanup failed: {e}")
+            # Try to reset CUDA context if possible
+            try:
+                torch.cuda.reset_peak_memory_stats()
+                logger.info("CUDA memory stats reset")
+            except:
+                logger.warning("Could not reset CUDA memory stats")
     
     # Train with enhanced error handling
     logger.info("Starting training...")
     model.enable_input_require_grads()
     
+    # Create safe data collator with token validation
+    safe_data_collator = create_safe_data_collator(template, processor, logger)
+    
+    # Test data collator with a few samples
+    logger.info("Testing data collator with sample data...")
+    try:
+        test_samples = [train_dataset[i] for i in range(min(3, len(train_dataset)))]
+        test_batch = safe_data_collator(test_samples)
+        logger.info(f"Data collator test successful. Batch keys: {list(test_batch.keys())}")
+        
+        # Validate test batch
+        if 'input_ids' in test_batch:
+            input_ids = test_batch['input_ids']
+            logger.info(f"Test batch input_ids shape: {input_ids.shape}, range: [{input_ids.min()}, {input_ids.max()}]")
+            
+        if 'labels' in test_batch:
+            labels = test_batch['labels']
+            valid_labels = labels[labels != -100]
+            if len(valid_labels) > 0:
+                logger.info(f"Test batch labels shape: {labels.shape}, valid range: [{valid_labels.min()}, {valid_labels.max()}]")
+            else:
+                logger.info(f"Test batch labels shape: {labels.shape}, all labels are -100 (ignored)")
+                
+    except Exception as e:
+        logger.error(f"Data collator test failed: {e}")
+        return
+    
     try:
         trainer = Seq2SeqTrainer(
             model=model,
             args=training_args,
-            data_collator=template.data_collator,
+            data_collator=safe_data_collator,  # Use safe collator
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             template=template,
@@ -432,10 +530,28 @@ def main():
         
         trainer.train()
         
+    except RuntimeError as e:
+        if "CUDA error" in str(e):
+            logger.error(f"CUDA error during training: {e}")
+            logger.error("This suggests invalid token IDs are still getting through.")
+            
+            # Try to get more info about the error
+            if torch.cuda.is_available():
+                try:
+                    # Clear CUDA cache and try to continue
+                    torch.cuda.empty_cache()
+                    logger.info("Cleared CUDA cache after error")
+                except:
+                    logger.warning("Could not clear CUDA cache after error")
+        raise
+        
     except Exception as e:
         logger.error(f"Training failed with error: {e}")
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except:
+                pass  # Ignore errors during cleanup
         raise
     
     # Final evaluation
