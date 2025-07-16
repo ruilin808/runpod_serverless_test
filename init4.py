@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
+Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
 """
 
 import os
 import torch
+import gc
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -12,6 +13,9 @@ def setup_gpus():
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
         print(f"Detected {gpu_count} GPU(s)")
+        
+        # Set memory management for better allocation
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         
         if gpu_count > 1:
             # Use all available GPUs
@@ -70,8 +74,17 @@ def filter_by_length(dataset, template, max_length):
     return dataset.filter(is_valid_length)
 
 
-def truncate_html_content(sample, max_html_chars=8000):
-    """Truncate HTML content if it's too long"""
+def truncate_html_content(sample, max_html_chars=None):
+    """Truncate HTML content based on available GPU memory"""
+    if max_html_chars is None:
+        # Scale HTML length based on GPU count and available memory
+        if gpu_count >= 8:
+            max_html_chars = 8000  # More GPUs = can handle longer sequences
+        elif gpu_count >= 4:
+            max_html_chars = 6000
+        else:
+            max_html_chars = 4000
+    
     if len(sample['html_table']) > max_html_chars:
         sample['html_table'] = sample['html_table'][:max_html_chars] + "..."
     return sample
@@ -82,9 +95,19 @@ def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_e
     if gpu_count <= 1:
         return base_batch_size, target_effective_batch_size // base_batch_size
     
-    # For multi-GPU, we can increase per-device batch size slightly
-    # but keep it conservative for memory constraints
-    per_device_batch_size = min(base_batch_size * 2, 4)  # Max 4 to avoid OOM
+    # Scale batch size based on GPU count while being conservative about memory
+    if gpu_count >= 8:
+        # With 8+ GPUs, we can afford slightly larger per-device batch size
+        per_device_batch_size = 2
+        target_effective_batch_size = 64  # Scale up effective batch size
+    elif gpu_count >= 4:
+        # With 4+ GPUs, moderate scaling
+        per_device_batch_size = 1
+        target_effective_batch_size = 32
+    else:
+        # 2-3 GPUs, conservative approach
+        per_device_batch_size = 1
+        target_effective_batch_size = 16
     
     # Calculate gradient accumulation to maintain effective batch size
     total_batch_size_per_step = per_device_batch_size * gpu_count
@@ -93,21 +116,46 @@ def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_e
     return per_device_batch_size, gradient_accumulation_steps
 
 
+def clear_gpu_memory():
+    """Clear GPU memory cache"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
 def main():
     """Main training function"""
     
     logger = get_logger()
     seed_everything(42)
     
-    # Configuration - Increased max_length to accommodate longer sequences
+    # Clear initial GPU memory
+    clear_gpu_memory()
+    
+    # Configuration - Scale parameters based on GPU count
     model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
     output_dir = 'output'
     data_seed = 42
-    max_length = 20480  # Increased from 16384
     
-    # LoRA configuration
-    lora_rank = 8
-    lora_alpha = 32
+    # Scale max_length based on GPU count for better memory distribution
+    if gpu_count >= 8:
+        max_length = 12288  # Can handle longer sequences with more GPUs
+    elif gpu_count >= 4:
+        max_length = 10240  # Moderate scaling
+    else:
+        max_length = 8192   # Conservative for 2-3 GPUs
+    
+    # LoRA configuration - Scale based on GPU count
+    if gpu_count >= 8:
+        lora_rank = 8      # Can afford higher rank with more GPUs
+        lora_alpha = 32
+    elif gpu_count >= 4:
+        lora_rank = 6      # Moderate scaling
+        lora_alpha = 24
+    else:
+        lora_rank = 4      # Conservative for fewer GPUs
+        lora_alpha = 16
+    
     freeze_llm = False
     freeze_vit = True
     freeze_aligner = True
@@ -117,13 +165,18 @@ def main():
         gpu_count, base_batch_size=1, target_effective_batch_size=32
     )
     
-    logger.info(f"Multi-GPU Configuration:")
+    logger.info(f"Multi-GPU Scaling Configuration:")
     logger.info(f"  - GPUs available: {gpu_count}")
     logger.info(f"  - Per-device batch size: {per_device_batch_size}")
     logger.info(f"  - Gradient accumulation steps: {gradient_accumulation_steps}")
     logger.info(f"  - Effective batch size: {per_device_batch_size * gpu_count * gradient_accumulation_steps}")
+    logger.info(f"  - Max sequence length: {max_length}")
+    logger.info(f"  - LoRA rank: {lora_rank}, alpha: {lora_alpha}")
     
-    # Training arguments - Adjusted for multi-GPU
+    # Adjust workers based on GPU count
+    dataloader_workers = min(4, max(2, gpu_count // 2))  # Scale workers with GPUs but cap at 4
+    
+    # Training arguments - Memory optimized
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
         learning_rate=1e-4,
@@ -136,51 +189,73 @@ def main():
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
-        save_steps=50,
+        save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=50,
+        eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
-        save_total_limit=5,
-        logging_steps=5,
-        dataloader_num_workers=4 * gpu_count,  # Scale workers with GPU count
+        save_total_limit=3,  # Reduced to save disk space
+        logging_steps=10,  # Increased to reduce overhead
+        dataloader_num_workers=dataloader_workers,  # Scale with GPU count
         data_seed=data_seed,
         remove_unused_columns=False,
-        max_grad_norm=1.0,  # Added gradient clipping
-        # Multi-GPU specific settings
-        dataloader_pin_memory=True,
-        ddp_find_unused_parameters=False,  # Can help with performance
-        ddp_timeout=1800,  # 30 minutes timeout for DDP
+        max_grad_norm=1.0,
+        # Memory optimization settings
+        dataloader_pin_memory=False,  # Disable to save memory
+        ddp_find_unused_parameters=False,
+        ddp_timeout=1800,
+        # Additional memory optimizations
+        fp16=True,  # Enable mixed precision training
+        dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
+        ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
+        save_safetensors=True,  # More efficient saving
     )
     
-    # Load model and setup template
-    model, processor = get_model_tokenizer(model_id_or_path)
+    # Load model with memory optimizations
+    logger.info("Loading model with memory optimizations...")
+    model, processor = get_model_tokenizer(
+        model_id_or_path,
+        torch_dtype=torch.float16,  # Use half precision
+        device_map='auto',  # Let accelerate handle device placement
+        low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+    )
+    
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
     template.set_mode('train')
     template.model = model
     
-    # Setup LoRA
+    # Setup LoRA with memory-efficient settings
     target_modules = get_multimodal_target_regex(model, freeze_llm=freeze_llm, freeze_vit=freeze_vit, 
                                 freeze_aligner=freeze_aligner)
-    lora_config = LoraConfig(task_type='CAUSAL_LM', r=lora_rank, lora_alpha=lora_alpha,
-                             target_modules=target_modules)
+    lora_config = LoraConfig(
+        task_type='CAUSAL_LM', 
+        r=lora_rank, 
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=0.1,  # Add dropout for regularization
+        bias="none",  # Don't adapt bias terms to save memory
+    )
     model = Swift.prepare_model(model, lora_config)
     
     model_parameter_info = get_model_parameter_info(model)
     logger.info(f'model_parameter_info: {model_parameter_info}')
     
+    # Clear memory after model loading
+    clear_gpu_memory()
+    
     # Load and process dataset
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply HTML truncation first (optional - use if you want to truncate rather than filter)
-    # train_processed = raw_dataset['train'].map(truncate_html_content)
-    # val_processed = raw_dataset['validation'].map(truncate_html_content)
+    # Apply HTML truncation to reduce sequence length
+    logger.info("Truncating HTML content...")
+    train_processed = raw_dataset['train'].map(truncate_html_content)
+    val_processed = raw_dataset['validation'].map(truncate_html_content)
     
     # Convert to Swift format
-    train_processed = raw_dataset['train'].map(create_swift_format_single)
-    val_processed = raw_dataset['validation'].map(create_swift_format_single)
+    train_processed = train_processed.map(create_swift_format_single)
+    val_processed = val_processed.map(create_swift_format_single)
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
@@ -199,8 +274,11 @@ def main():
     
     # Check if we have enough data after filtering
     if len(train_dataset) == 0:
-        logger.error("No training samples remain after filtering! Consider increasing max_length or truncating HTML content.")
+        logger.error("No training samples remain after filtering! Consider increasing max_length or reducing HTML truncation.")
         return
+    
+    # Clear memory before training
+    clear_gpu_memory()
     
     # Train
     model.enable_input_require_grads()
@@ -214,9 +292,17 @@ def main():
     )
     
     try:
+        # Monitor GPU memory during training
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                logger.info(f"GPU {i} memory before training: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
+        
         trainer.train()
+        
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        # Clear memory on failure
+        clear_gpu_memory()
         return
     
     # Save visualization
@@ -225,6 +311,9 @@ def main():
     plot_images(visual_loss_dir, training_args.logging_dir, ['train/loss'], 0.9)
     
     logger.info(f'Training complete. Model saved to: {trainer.state.last_model_checkpoint}')
+    
+    # Final memory cleanup
+    clear_gpu_memory()
 
 
 if __name__ == "__main__":
