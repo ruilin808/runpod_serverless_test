@@ -101,6 +101,12 @@ class InferenceCallback(TrainerCallback):
                         # Encode input
                         inputs = self.template.encode(inference_sample)
                         
+                        # Convert to tensors if they're lists
+                        if isinstance(inputs['input_ids'], list):
+                            inputs['input_ids'] = torch.tensor(inputs['input_ids'])
+                        if isinstance(inputs['attention_mask'], list):
+                            inputs['attention_mask'] = torch.tensor(inputs['attention_mask'])
+                        
                         # Move to device and add batch dimension
                         input_ids = inputs['input_ids'].unsqueeze(0).to(model.device)
                         attention_mask = inputs['attention_mask'].unsqueeze(0).to(model.device)
