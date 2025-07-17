@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support and TEDS Evaluation
+Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
 """
 
 import os
 import torch
 import gc
-import json
-import re
-from multiprocessing import Pool, cpu_count
-from typing import List, Dict, Any
-from transformers import TrainerCallback
 
-# Auto-detect and use all available GPUs
+# Set GPU config before any CUDA operations
 def setup_gpus():
     """Setup GPU configuration based on available devices"""
     if torch.cuda.is_available():
@@ -22,22 +17,12 @@ def setup_gpus():
         # Set memory management for better allocation
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         
-        if gpu_count > 1:
-            # Use all available GPUs
-            gpu_ids = ','.join(str(i) for i in range(gpu_count))
-            os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
-            print(f"Using GPUs: {gpu_ids}")
-            return gpu_count
-        else:
-            # Single GPU
-            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-            print("Using single GPU: 0")
-            return 1
+        return gpu_count
     else:
         print("No CUDA GPUs available")
         return 0
 
-# Setup GPUs before importing other modules
+# Setup GPUs early but don't set CUDA_VISIBLE_DEVICES
 gpu_count = setup_gpus()
 
 from swift.llm import (
@@ -49,228 +34,6 @@ from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
 
-# NEW: Import TEDS evaluation
-try:
-    from table_recognition_metric import TEDS
-    TEDS_AVAILABLE = True
-    print("TEDS evaluation enabled")
-except ImportError:
-    TEDS_AVAILABLE = False
-    print("WARNING: table_recognition_metric not installed. TEDS evaluation disabled.")
-    print("Install with: pip install table_recognition_metric")
-
-# NEW: HTML normalization for better TEDS comparison
-def normalize_html_for_teds(html_string: str) -> str:
-    """Normalize HTML for better TEDS comparison"""
-    try:
-        from bs4 import BeautifulSoup
-        
-        # Parse and clean HTML
-        soup = BeautifulSoup(html_string, 'html.parser')
-        
-        # Remove unnecessary attributes but keep essential table structure
-        for tag in soup.find_all():
-            if tag.name == 'table':
-                # Keep essential table attributes
-                tag.attrs = {k: v for k, v in tag.attrs.items() if k in ['border', 'cellpadding', 'cellspacing']}
-            elif tag.name in ['td', 'th']:
-                # Keep cell spanning attributes
-                tag.attrs = {k: v for k, v in tag.attrs.items() if k in ['colspan', 'rowspan']}
-            else:
-                # Remove all other attributes
-                tag.attrs = {}
-        
-        # Get clean HTML
-        clean_html = str(soup)
-        
-        # Normalize whitespace
-        clean_html = re.sub(r'\s+', ' ', clean_html)
-        clean_html = re.sub(r'>\s+<', '><', clean_html)
-        
-        return clean_html.strip()
-        
-    except Exception as e:
-        print(f"Warning: HTML normalization failed: {e}")
-        return html_string.strip()
-
-# NEW: TEDS evaluation functions
-def evaluate_single_teds(args):
-    """Evaluate single prediction-ground truth pair with TEDS"""
-    if not TEDS_AVAILABLE:
-        return 0.0
-    
-    predicted_html, ground_truth_html = args
-    try:
-        teds_evaluator = TEDS()
-        
-        # Normalize both HTML strings
-        pred_normalized = normalize_html_for_teds(predicted_html)
-        gt_normalized = normalize_html_for_teds(ground_truth_html)
-        
-        # Calculate TEDS score
-        score = teds_evaluator.evaluate(pred_normalized, gt_normalized)
-        return float(score)
-        
-    except Exception as e:
-        print(f"Warning: TEDS evaluation failed for sample: {e}")
-        return 0.0
-
-def evaluate_teds_parallel(predictions: List[str], ground_truths: List[str]) -> Dict[str, float]:
-    """Evaluate TEDS scores in parallel using multiple CPU cores"""
-    if not TEDS_AVAILABLE or len(predictions) == 0:
-        return {"teds_score": 0.0, "teds_count": 0}
-    
-    # Determine number of processes based on CPU count and GPU count
-    # Use more CPU cores when we have more GPUs (since we have more computational resources)
-    if gpu_count >= 8:
-        num_processes = min(cpu_count(), 8)  # Use up to 8 cores for large GPU setups
-    elif gpu_count >= 4:
-        num_processes = min(cpu_count(), 6)  # Use up to 6 cores for medium GPU setups
-    else:
-        num_processes = min(cpu_count(), 4)  # Use up to 4 cores for small GPU setups
-    
-    print(f"Evaluating TEDS with {num_processes} CPU processes for {len(predictions)} samples")
-    
-    try:
-        # Prepare arguments for parallel processing
-        eval_args = list(zip(predictions, ground_truths))
-        
-        # Use multiprocessing for parallel TEDS evaluation
-        with Pool(processes=num_processes) as pool:
-            scores = pool.map(evaluate_single_teds, eval_args)
-        
-        # Calculate statistics
-        valid_scores = [s for s in scores if s > 0]  # Filter out failed evaluations
-        
-        if len(valid_scores) == 0:
-            return {"teds_score": 0.0, "teds_count": 0}
-        
-        avg_score = sum(valid_scores) / len(valid_scores)
-        
-        return {
-            "teds_score": avg_score,
-            "teds_count": len(valid_scores),
-            "teds_failed": len(scores) - len(valid_scores)
-        }
-        
-    except Exception as e:
-        print(f"Error in parallel TEDS evaluation: {e}")
-        return {"teds_score": 0.0, "teds_count": 0}
-
-# NEW: Custom callback for TEDS evaluation during training
-class TEDSEvaluationCallback(TrainerCallback):
-    """Custom callback to compute TEDS scores during training"""
-    
-    def __init__(self, template, eval_dataset, eval_frequency=100, gpu_count=1):
-        super().__init__()
-        self.template = template
-        self.eval_dataset = eval_dataset
-        self.eval_frequency = eval_frequency
-        self.gpu_count = gpu_count
-        self.step_count = 0
-        self.eval_count = 0
-        self.teds_history = []
-        
-        # Scale sample sizes based on GPU count
-        if gpu_count >= 8:
-            self.quick_sample_size = min(50, len(eval_dataset))    # Larger setups can afford more
-            self.thorough_sample_size = min(150, len(eval_dataset))
-        elif gpu_count >= 4:
-            self.quick_sample_size = min(30, len(eval_dataset))    # Moderate sampling
-            self.thorough_sample_size = min(100, len(eval_dataset))
-        else:
-            self.quick_sample_size = min(20, len(eval_dataset))    # Conservative for smaller setups
-            self.thorough_sample_size = min(75, len(eval_dataset))
-        
-        print(f"TEDS Evaluation Configuration:")
-        print(f"  - Quick evaluation: {self.quick_sample_size} samples")
-        print(f"  - Thorough evaluation: {self.thorough_sample_size} samples (every 5th evaluation)")
-    
-    def on_init_end(self, args, state, control, **kwargs):
-        """Called at the end of trainer initialization"""
-        print("TEDS Evaluation Callback initialized successfully")
-        return control
-    
-    def on_evaluate(self, args, state, control, logs=None, **kwargs):
-        """Called during evaluation to compute TEDS scores"""
-        if not TEDS_AVAILABLE or logs is None:
-            return control
-        
-        try:
-            self.eval_count += 1
-            
-            # Use thorough evaluation every 5th time, quick evaluation otherwise
-            is_thorough_eval = (self.eval_count % 5 == 0)
-            eval_sample_size = self.thorough_sample_size if is_thorough_eval else self.quick_sample_size
-            
-            eval_type = "thorough" if is_thorough_eval else "quick"
-            print(f"Computing TEDS ({eval_type}) on {eval_sample_size} samples...")
-            
-            eval_indices = torch.randperm(len(self.eval_dataset))[:eval_sample_size]
-            
-            predictions = []
-            ground_truths = []
-            
-            # Generate predictions for sampled data
-            with torch.no_grad():
-                for idx in eval_indices:
-                    sample = self.eval_dataset[idx]
-                    
-                    # Extract ground truth HTML
-                    if hasattr(sample, 'get') and 'messages' in sample:
-                        for message in sample['messages']:
-                            if message.get('role') == 'assistant':
-                                ground_truths.append(message.get('content', ''))
-                                break
-                    elif hasattr(sample, '__getitem__'):
-                        # Handle different dataset formats
-                        try:
-                            if 'html_table' in sample:
-                                ground_truths.append(sample['html_table'])
-                            elif 'target' in sample:
-                                ground_truths.append(sample['target'])
-                            else:
-                                ground_truths.append('')
-                        except:
-                            ground_truths.append('')
-                    else:
-                        ground_truths.append('')
-                    
-                    # Generate prediction (simplified - in real implementation you'd use the model)
-                    # This is a placeholder - actual implementation would generate from model
-                    predicted_html = "<table><tr><td>Placeholder</td></tr></table>"
-                    predictions.append(predicted_html)
-            
-            # Compute TEDS scores in parallel
-            teds_results = evaluate_teds_parallel(predictions, ground_truths)
-            
-            # Add TEDS results to logs
-            if logs is not None:
-                logs.update(teds_results)
-            
-            # Store history with evaluation type
-            self.teds_history.append({
-                'step': state.global_step,
-                'eval_count': self.eval_count,
-                'teds_score': teds_results.get('teds_score', 0.0),
-                'sample_size': eval_sample_size,
-                'eval_type': eval_type
-            })
-            
-            print(f"TEDS Score ({eval_type}): {teds_results.get('teds_score', 0.0):.4f} "
-                  f"({eval_sample_size} samples)")
-            
-        except Exception as e:
-            print(f"Error in TEDS evaluation: {e}")
-            if logs is not None:
-                logs['teds_score'] = 0.0
-        
-        return control
-    
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        """Called on each logging step"""
-        self.step_count = state.global_step
-        return control
 
 def create_swift_format_single(sample):
     """Convert single sample to Swift format"""
@@ -288,19 +51,30 @@ def create_swift_format_single(sample):
         'images': [sample['image']]
     }
 
+
 def filter_by_length(dataset, template, max_length):
     """Filter out samples that exceed max_length after encoding"""
+    dropped_count = 0
+    
     def is_valid_length(sample):
+        nonlocal dropped_count
         try:
             encoded = template.encode(sample)
             return len(encoded['input_ids']) <= max_length
-        except Exception:
+        except Exception as e:
+            print(f"Encoding failed for sample: {e}")
+            dropped_count += 1
             return False
     
-    return dataset.filter(is_valid_length)
+    filtered_dataset = dataset.filter(is_valid_length)
+    if dropped_count > 0:
+        print(f"Dropped {dropped_count} samples due to encoding errors")
+    
+    return filtered_dataset
 
-def truncate_html_content(sample, max_html_chars=None):
-    """Truncate HTML content based on available GPU memory"""
+
+def truncate_html_content(samples, max_html_chars=None):
+    """Truncate HTML content based on available GPU memory - batch processing"""
     if max_html_chars is None:
         # Scale HTML length based on GPU count and available memory
         if gpu_count >= 8:
@@ -310,9 +84,24 @@ def truncate_html_content(sample, max_html_chars=None):
         else:
             max_html_chars = 4000
     
-    if len(sample['html_table']) > max_html_chars:
-        sample['html_table'] = sample['html_table'][:max_html_chars] + "..."
-    return sample
+    # Handle both single sample and batch processing
+    if isinstance(samples, dict) and 'html_table' in samples:
+        # Single sample
+        if len(samples['html_table']) > max_html_chars:
+            samples['html_table'] = samples['html_table'][:max_html_chars] + "..."
+        return samples
+    else:
+        # Batch processing
+        truncated_tables = []
+        for html_table in samples['html_table']:
+            if len(html_table) > max_html_chars:
+                truncated_tables.append(html_table[:max_html_chars] + "...")
+            else:
+                truncated_tables.append(html_table)
+        
+        samples['html_table'] = truncated_tables
+        return samples
+
 
 def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_effective_batch_size=32):
     """Calculate optimal batch size and gradient accumulation steps for multi-GPU setup"""
@@ -339,11 +128,13 @@ def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_e
     
     return per_device_batch_size, gradient_accumulation_steps
 
+
 def clear_gpu_memory():
     """Clear GPU memory cache"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
+
 
 def main():
     """Main training function"""
@@ -355,7 +146,7 @@ def main():
     clear_gpu_memory()
     
     # Configuration - Scale parameters based on GPU count
-    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
+    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
     output_dir = 'output'
     data_seed = 42
     
@@ -394,22 +185,9 @@ def main():
     logger.info(f"  - Effective batch size: {per_device_batch_size * gpu_count * gradient_accumulation_steps}")
     logger.info(f"  - Max sequence length: {max_length}")
     logger.info(f"  - LoRA rank: {lora_rank}, alpha: {lora_alpha}")
-    logger.info(f"  - TEDS evaluation: {'Enabled' if TEDS_AVAILABLE else 'Disabled'}")
     
     # Adjust workers based on GPU count
     dataloader_workers = min(4, max(2, gpu_count // 2))  # Scale workers with GPUs but cap at 4
-    
-    # NEW: Adjust evaluation frequency based on GPU count
-    # More GPUs = can afford more frequent evaluation
-    if gpu_count >= 8:
-        eval_steps = 50   # More frequent evaluation with more GPUs
-        save_steps = 50
-    elif gpu_count >= 4:
-        eval_steps = 100  # Moderate evaluation frequency
-        save_steps = 100
-    else:
-        eval_steps = 150  # Less frequent evaluation with fewer GPUs
-        save_steps = 150
     
     # Training arguments - Memory optimized
     training_args = Seq2SeqTrainingArguments(
@@ -424,12 +202,12 @@ def main():
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
-        save_steps=save_steps,
+        save_steps=100,
         eval_strategy='steps',
-        eval_steps=eval_steps,
+        eval_steps=100,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
-        metric_for_best_model='loss',  # Could be changed to 'teds_score' if implemented
+        metric_for_best_model='loss',
         save_total_limit=3,
         logging_steps=10,
         dataloader_num_workers=dataloader_workers,
@@ -437,25 +215,22 @@ def main():
         remove_unused_columns=False,
         max_grad_norm=1.0,
         # Memory optimization settings
-        dataloader_pin_memory=False,
+        dataloader_pin_memory=True,  # Enable for GPU training
         ddp_find_unused_parameters=False,
         ddp_timeout=1800,
-        # Additional memory optimizations
-        fp16=True,
+        # Use bf16 for better stability
+        bf16=True,
         dataloader_prefetch_factor=2,
         ddp_bucket_cap_mb=25,
         save_safetensors=True,
-        # NEW: Enable evaluation prediction saving for TEDS
-        predict_with_generate=True,
-        include_inputs_for_metrics=True,
     )
     
     # Load model with memory optimizations
     logger.info("Loading model with memory optimizations...")
     model, processor = get_model_tokenizer(
         model_id_or_path,
-        torch_dtype=torch.float16,
-        device_map='auto',
+        torch_dtype=torch.bfloat16,  # Use bfloat16 for consistency
+        device_map='auto',  # Let accelerate handle device placement
         low_cpu_mem_usage=True,
     )
     
@@ -486,14 +261,24 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply HTML truncation to reduce sequence length
+    # Apply HTML truncation to reduce sequence length - process in batches
     logger.info("Truncating HTML content...")
-    train_processed = raw_dataset['train'].map(truncate_html_content)
-    val_processed = raw_dataset['validation'].map(truncate_html_content)
+    train_processed = raw_dataset['train'].map(
+        truncate_html_content, 
+        batched=True, 
+        batch_size=100,
+        desc="Truncating train HTML"
+    )
+    val_processed = raw_dataset['validation'].map(
+        truncate_html_content, 
+        batched=True, 
+        batch_size=100,
+        desc="Truncating validation HTML"
+    )
     
     # Convert to Swift format
-    train_processed = train_processed.map(create_swift_format_single)
-    val_processed = val_processed.map(create_swift_format_single)
+    train_processed = train_processed.map(create_swift_format_single, desc="Converting train to Swift format")
+    val_processed = val_processed.map(create_swift_format_single, desc="Converting validation to Swift format")
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
@@ -515,17 +300,6 @@ def main():
         logger.error("No training samples remain after filtering! Consider increasing max_length or reducing HTML truncation.")
         return
     
-    # NEW: Initialize TEDS evaluation callback
-    teds_callback = None
-    if TEDS_AVAILABLE:
-        teds_callback = TEDSEvaluationCallback(
-            template=template,
-            eval_dataset=val_dataset,
-            eval_frequency=eval_steps,
-            gpu_count=gpu_count  # Pass GPU count for sample size scaling
-        )
-        logger.info("TEDS evaluation callback initialized with optimized sample sizes")
-    
     # Clear memory before training
     clear_gpu_memory()
     
@@ -538,8 +312,6 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
-        # NEW: Add callbacks if available
-        callbacks=[teds_callback] if teds_callback else None,
     )
     
     try:
@@ -550,47 +322,11 @@ def main():
         
         trainer.train()
         
-        # NEW: Final TEDS evaluation on full validation set
-        if TEDS_AVAILABLE:
-            logger.info("Performing final TEDS evaluation on full validation set...")
-            
-            # Generate predictions for full validation set
-            predictions = []
-            ground_truths = []
-            
-            with torch.no_grad():
-                for i in range(min(500, len(val_dataset))):  # Limit to 500 samples for final eval
-                    sample = val_dataset[i]
-                    
-                    # Extract ground truth
-                    if 'messages' in sample:
-                        for message in sample['messages']:
-                            if message['role'] == 'assistant':
-                                ground_truths.append(message['content'])
-                                break
-                    
-                    # Generate prediction (placeholder)
-                    predicted_html = "<table><tr><td>Final Placeholder</td></tr></table>"
-                    predictions.append(predicted_html)
-            
-            # Compute final TEDS scores
-            final_teds_results = evaluate_teds_parallel(predictions, ground_truths)
-            logger.info(f"Final TEDS Results: {final_teds_results}")
-            
-            # Save TEDS results
-            teds_results_path = os.path.join(output_dir, 'teds_results.json')
-            with open(teds_results_path, 'w') as f:
-                json.dump({
-                    'final_teds_results': final_teds_results,
-                    'teds_history': teds_callback.teds_history if teds_callback else []
-                }, f, indent=2)
-            
-            logger.info(f"TEDS results saved to: {teds_results_path}")
-        
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        # Clear memory on failure
         clear_gpu_memory()
-        return
+        raise  # Re-raise to see full traceback
     
     # Save visualization
     visual_loss_dir = os.path.join(os.path.abspath(output_dir), 'visual_loss')
@@ -601,6 +337,7 @@ def main():
     
     # Final memory cleanup
     clear_gpu_memory()
+
 
 if __name__ == "__main__":
     main()
