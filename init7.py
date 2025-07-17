@@ -282,7 +282,7 @@ def main():
         save_strategy='steps',
         save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=100,  # Increased to reduce I/O
+        eval_steps=2,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
