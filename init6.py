@@ -191,7 +191,8 @@ def main():
         ddp_find_unused_parameters=False,
         ddp_timeout=1800,
         # Additional memory optimizations
-        fp16=True,  # Enable mixed precision training
+        fp16=False,  # Enable mixed precision training
+        bf16=True,  # Use bfloat16 if available
         dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
         ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
         save_safetensors=True,  # More efficient saving
