@@ -122,7 +122,7 @@ def compute_teds_metrics(model, processor, template, val_dataset, device, max_sa
         for i in range(eval_samples):
             try:
                 # Get sample
-                sample = val_dataset.dataset[i]
+                sample = val_dataset[i]
                 
                 # Prepare input for generation
                 messages = [{'role': 'user', 'content': 'Write the HTML representation for this image of a medical table.'}]
@@ -270,7 +270,7 @@ def main():
         save_strategy='steps',
         save_steps=100,
         eval_strategy='steps',
-        eval_steps=10,
+        eval_steps=5,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='eval_teds_score',  # Use TEDS as best model metric
