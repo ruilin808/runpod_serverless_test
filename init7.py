@@ -129,7 +129,7 @@ def compute_teds_metrics(model, processor, template, val_dataset, device, max_sa
                 inputs = processor.apply_chat_template(messages, images=[sample['images'][0]], add_generation_prompt=True)
                 
                 # Generate prediction
-                inputs = inputs.to(device)
+                inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
                 outputs = model.generate(
                     **inputs,
                     max_new_tokens=2048,
