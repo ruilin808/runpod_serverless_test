@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Optimized Qwen2-VL Fine-tuning Script with Standard LoRA
-Fixed and Concise Version for 6x A40 GPUs
 """
 
 import os
@@ -172,10 +171,16 @@ def preprocess_sample(sample):
     
     return {
         'messages': [
-            {'role': 'user', 'content': 'Write the HTML representation for this image of a medical table.'},
-            {'role': 'assistant', 'content': sample['html_table']}
+            {
+                'role': 'user',
+                'content': 'Write the HTML representation for this image of a medical table.'
+            },
+            {
+                'role': 'assistant',
+                'content': sample['html_table']
+            }
         ],
-        'images': [image]
+        'images': [sample['image']]
     }
 
 
@@ -228,7 +233,7 @@ def main():
     # Configuration
     model_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
     output_dir = 'output'
-    max_length = 6144  # Conservative for A40 with 32B model
+    max_length = 16384  
     lora_rank = 6
     lora_alpha = 24
     
