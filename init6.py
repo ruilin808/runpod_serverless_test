@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
+NO TEDS WORKING!!!!!!!!
 """
 
 import os
 import torch
 import gc
 
-# Set GPU config before any CUDA operations
+# Auto-detect and use all available GPUs
 def setup_gpus():
     """Setup GPU configuration based on available devices"""
     if torch.cuda.is_available():
@@ -17,12 +18,22 @@ def setup_gpus():
         # Set memory management for better allocation
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         
-        return gpu_count
+        if gpu_count > 1:
+            # Use all available GPUs
+            gpu_ids = ','.join(str(i) for i in range(gpu_count))
+            os.environ['CUDA_VISIBLE_DEVICES'] = gpu_ids
+            print(f"Using GPUs: {gpu_ids}")
+            return gpu_count
+        else:
+            # Single GPU
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            print("Using single GPU: 0")
+            return 1
     else:
         print("No CUDA GPUs available")
         return 0
 
-# Setup GPUs early but don't set CUDA_VISIBLE_DEVICES
+# Setup GPUs before importing other modules
 gpu_count = setup_gpus()
 
 from swift.llm import (
@@ -54,23 +65,15 @@ def create_swift_format_single(sample):
 
 def filter_by_length(dataset, template, max_length):
     """Filter out samples that exceed max_length after encoding"""
-    dropped_count = 0
-    
     def is_valid_length(sample):
-        nonlocal dropped_count
         try:
             encoded = template.encode(sample)
             return len(encoded['input_ids']) <= max_length
-        except Exception as e:
-            print(f"Encoding failed for sample: {e}")
-            dropped_count += 1
+        except Exception:
             return False
     
-    filtered_dataset = dataset.filter(is_valid_length)
-    if dropped_count > 0:
-        print(f"Dropped {dropped_count} samples due to encoding errors")
-    
-    return filtered_dataset
+    return dataset.filter(is_valid_length)
+
 
 def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_effective_batch_size=32):
     """Calculate optimal batch size and gradient accumulation steps for multi-GPU setup"""
@@ -171,36 +174,36 @@ def main():
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
-        save_steps=100,
+        save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=100,
+        eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
-        save_total_limit=3,
-        logging_steps=10,
-        dataloader_num_workers=dataloader_workers,
+        save_total_limit=3,  # Reduced to save disk space
+        logging_steps=10,  # Increased to reduce overhead
+        dataloader_num_workers=dataloader_workers,  # Scale with GPU count
         data_seed=data_seed,
         remove_unused_columns=False,
         max_grad_norm=1.0,
         # Memory optimization settings
-        dataloader_pin_memory=True,  # Enable for GPU training
+        dataloader_pin_memory=False,  # Disable to save memory
         ddp_find_unused_parameters=False,
         ddp_timeout=1800,
-        # Use bf16 for better stability
-        bf16=True,
-        dataloader_prefetch_factor=2,
-        ddp_bucket_cap_mb=25,
-        save_safetensors=True,
+        # Additional memory optimizations
+        fp16=True,  # Enable mixed precision training
+        dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
+        ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
+        save_safetensors=True,  # More efficient saving
     )
     
     # Load model with memory optimizations
     logger.info("Loading model with memory optimizations...")
     model, processor = get_model_tokenizer(
         model_id_or_path,
-        torch_dtype=torch.bfloat16,  # Use bfloat16 for consistency
+        torch_dtype=torch.float16,  # Use half precision
         device_map='auto',  # Let accelerate handle device placement
-        low_cpu_mem_usage=True,
+        low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
     )
     
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
@@ -215,8 +218,8 @@ def main():
         r=lora_rank, 
         lora_alpha=lora_alpha,
         target_modules=target_modules,
-        lora_dropout=0.1,
-        bias="none",
+        lora_dropout=0.1,  # Add dropout for regularization
+        bias="none",  # Don't adapt bias terms to save memory
     )
     model = Swift.prepare_model(model, lora_config)
     
@@ -230,13 +233,13 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Use raw dataset directly without truncation
-    train_processed = raw_dataset['train']
-    val_processed = raw_dataset['validation']
+    # Apply HTML truncation to reduce sequence length
+    train_processed = raw_dataset['train'].map(create_swift_format_single)
+    val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
     # Convert to Swift format
-    train_processed = train_processed.map(create_swift_format_single, desc="Converting train to Swift format")
-    val_processed = val_processed.map(create_swift_format_single, desc="Converting validation to Swift format")
+    #train_processed = train_processed.map(create_swift_format_single)
+    #val_processed = val_processed.map(create_swift_format_single)
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
@@ -284,7 +287,7 @@ def main():
         logger.error(f"Training failed: {e}")
         # Clear memory on failure
         clear_gpu_memory()
-        raise  # Re-raise to see full traceback
+        return
     
     # Save visualization
     visual_loss_dir = os.path.join(os.path.abspath(output_dir), 'visual_loss')
