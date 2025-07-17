@@ -101,10 +101,22 @@ class InferenceCallback(TrainerCallback):
                         # Encode input
                         inputs = self.template.encode(inference_sample)
                         
-                        # Convert to tensors if they're lists
+                        # Debug: Check what keys are available
+                        print(f"Available keys in inputs: {list(inputs.keys())}")
+                        
+                        # Convert to tensors if they're lists and handle missing keys
+                        if 'input_ids' not in inputs:
+                            print(f"❌ Missing 'input_ids' in encoded inputs")
+                            continue
+                            
                         if isinstance(inputs['input_ids'], list):
                             inputs['input_ids'] = torch.tensor(inputs['input_ids'])
-                        if isinstance(inputs['attention_mask'], list):
+                        
+                        # Handle attention_mask - create if missing
+                        if 'attention_mask' not in inputs:
+                            print("⚠️ Creating attention_mask from input_ids")
+                            inputs['attention_mask'] = torch.ones_like(inputs['input_ids'])
+                        elif isinstance(inputs['attention_mask'], list):
                             inputs['attention_mask'] = torch.tensor(inputs['attention_mask'])
                         
                         # Move to device and add batch dimension
