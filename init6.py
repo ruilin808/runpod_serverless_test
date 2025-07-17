@@ -233,7 +233,7 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply HTML truncation to reduce sequence length
+    # no HTML truncation to reduce sequence length
     train_processed = raw_dataset['train'].map(create_swift_format_single)
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
