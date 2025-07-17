@@ -72,37 +72,6 @@ def filter_by_length(dataset, template, max_length):
     
     return filtered_dataset
 
-
-def truncate_html_content(samples, max_html_chars=None):
-    """Truncate HTML content based on available GPU memory - batch processing"""
-    if max_html_chars is None:
-        # Scale HTML length based on GPU count and available memory
-        if gpu_count >= 8:
-            max_html_chars = 8000  # More GPUs = can handle longer sequences
-        elif gpu_count >= 4:
-            max_html_chars = 6000
-        else:
-            max_html_chars = 4000
-    
-    # Handle both single sample and batch processing
-    if isinstance(samples, dict) and 'html_table' in samples:
-        # Single sample
-        if len(samples['html_table']) > max_html_chars:
-            samples['html_table'] = samples['html_table'][:max_html_chars] + "..."
-        return samples
-    else:
-        # Batch processing
-        truncated_tables = []
-        for html_table in samples['html_table']:
-            if len(html_table) > max_html_chars:
-                truncated_tables.append(html_table[:max_html_chars] + "...")
-            else:
-                truncated_tables.append(html_table)
-        
-        samples['html_table'] = truncated_tables
-        return samples
-
-
 def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_effective_batch_size=32):
     """Calculate optimal batch size and gradient accumulation steps for multi-GPU setup"""
     if gpu_count <= 1:
@@ -261,20 +230,9 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply HTML truncation to reduce sequence length - process in batches
-    logger.info("Truncating HTML content...")
-    train_processed = raw_dataset['train'].map(
-        truncate_html_content, 
-        batched=True, 
-        batch_size=100,
-        desc="Truncating train HTML"
-    )
-    val_processed = raw_dataset['validation'].map(
-        truncate_html_content, 
-        batched=True, 
-        batch_size=100,
-        desc="Truncating validation HTML"
-    )
+    # Use raw dataset directly without truncation
+    train_processed = raw_dataset['train']
+    val_processed = raw_dataset['validation']
     
     # Convert to Swift format
     train_processed = train_processed.map(create_swift_format_single, desc="Converting train to Swift format")
