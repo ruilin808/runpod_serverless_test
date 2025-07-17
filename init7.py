@@ -7,8 +7,6 @@ NO TEDS WORKING!!!!!!!!
 import os
 import torch
 import gc
-import numpy as np
-from transformers import TrainerCallback
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -46,130 +44,6 @@ from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
-
-
-class InferenceCallback(TrainerCallback):
-    """Callback to run inference on validation samples during evaluation"""
-    
-    def __init__(self, eval_dataset, template, processor, num_samples=3, max_gen_length=512):
-        self.eval_dataset = eval_dataset
-        self.template = template
-        self.processor = processor  # Store processor/tokenizer
-        self.num_samples = min(num_samples, len(eval_dataset)) if len(eval_dataset) > 0 else 0
-        self.max_gen_length = max_gen_length
-        
-        # Pre-select samples to maintain consistency across evaluations
-        if self.num_samples > 0:
-            np.random.seed(42)  # Fixed seed for reproducible samples
-            indices = np.random.choice(
-                len(self.eval_dataset), 
-                self.num_samples, 
-                replace=False
-            )
-            self.sample_indices = [int(idx) for idx in indices]  # Simple conversion to Python ints
-    
-    def on_evaluate(self, args, state, control, model, **kwargs):
-        """Called at the end of evaluation - runs inference on validation samples"""
-        
-        # Only run on main process to avoid duplicated output
-        if args.local_rank not in [-1, 0]:
-            return
-            
-        # Skip if no samples to evaluate
-        if self.num_samples == 0:
-            return
-            
-        try:
-            print(f"\n🔍 Running inference validation at step {state.global_step}")
-            print("=" * 70)
-            
-            # Ensure model is in eval mode
-            model.eval()
-            
-            with torch.no_grad():
-                for i, idx in enumerate(self.sample_indices):
-                    try:
-                        sample = self.eval_dataset[idx]
-                        
-                        # Prepare input (just the user message for inference)
-                        user_message = sample['messages'][0]['content']
-                        inference_sample = {
-                            'messages': [{'role': 'user', 'content': user_message}],
-                            'images': sample.get('images', [])
-                        }
-                        
-                        # Encode input
-                        inputs = self.template.encode(inference_sample)
-                        
-                        # Debug: Check what keys are available
-                        print(f"Available keys in inputs: {list(inputs.keys())}")
-                        
-                        # Convert to tensors if they're lists and handle missing keys
-                        if 'input_ids' not in inputs:
-                            print(f"❌ Missing 'input_ids' in encoded inputs")
-                            continue
-                            
-                        if isinstance(inputs['input_ids'], list):
-                            inputs['input_ids'] = torch.tensor(inputs['input_ids'])
-                        
-                        # Handle attention_mask - create if missing
-                        if 'attention_mask' not in inputs:
-                            print("⚠️ Creating attention_mask from input_ids")
-                            inputs['attention_mask'] = torch.ones_like(inputs['input_ids'])
-                        elif isinstance(inputs['attention_mask'], list):
-                            inputs['attention_mask'] = torch.tensor(inputs['attention_mask'])
-                        
-                        # Move to device and add batch dimension
-                        input_ids = inputs['input_ids'].unsqueeze(0).to(model.device)
-                        attention_mask = inputs['attention_mask'].unsqueeze(0).to(model.device)
-                        
-                        # Generate with conservative settings
-                        outputs = model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            max_length=min(self.max_gen_length, len(inputs['input_ids']) + 256),
-                            do_sample=False,  # Deterministic
-                            num_beams=1,      # Faster than beam search
-                            pad_token_id=self.processor.tokenizer.pad_token_id,
-                            eos_token_id=self.processor.tokenizer.eos_token_id,
-                        )
-                        
-                        # Decode prediction (remove input tokens)
-                        generated_tokens = outputs[0][len(input_ids[0]):]
-                        predicted_text = self.processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                        
-                        # Get ground truth
-                        ground_truth = sample['messages'][1]['content']
-                        
-                        # Display results
-                        print(f"\n--- Validation Sample {i+1} (Index: {idx}) ---")
-                        print(f"Input: {user_message}")
-                        print(f"Prediction: {predicted_text[:300]}{'...' if len(predicted_text) > 300 else ''}")
-                        print(f"Ground Truth: {ground_truth[:300]}{'...' if len(ground_truth) > 300 else ''}")
-                        
-                        # Simple quality check
-                        if predicted_text.strip():
-                            print(f"✅ Generated non-empty response")
-                        else:
-                            print(f"❌ Generated empty response")
-                            
-                    except Exception as e:
-                        print(f"❌ Failed to process sample {idx}: {e}")
-                        continue
-                        
-            print("=" * 70)
-            print(f"✅ Inference validation completed at step {state.global_step}\n")
-            
-        except Exception as e:
-            print(f"❌ Inference callback failed: {e}")
-            # Training continues normally
-        
-        finally:
-            # Ensure we're back in training mode
-            model.train()
-            # Clear any accumulated memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
 
 def create_swift_format_single(sample):
@@ -244,7 +118,7 @@ def main():
     clear_gpu_memory()
     
     # Configuration - Scale parameters based on GPU count
-    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
+    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
     output_dir = 'output'
     data_seed = 42
     
@@ -302,7 +176,7 @@ def main():
         save_strategy='steps',
         save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=2,  # Increased to reduce I/O
+        eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
@@ -363,6 +237,10 @@ def main():
     train_processed = raw_dataset['train'].map(create_swift_format_single)
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
+    # Convert to Swift format
+    #train_processed = train_processed.map(create_swift_format_single)
+    #val_processed = val_processed.map(create_swift_format_single)
+    
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
     # Filter out samples that are too long
@@ -383,19 +261,6 @@ def main():
         logger.error("No training samples remain after filtering! Consider increasing max_length or reducing HTML truncation.")
         return
     
-    # Create inference callback
-    # Scale number of inference samples based on validation dataset size
-    inference_samples = min(3, len(val_dataset))  # Don't exceed available samples
-    inference_callback = InferenceCallback(
-        eval_dataset=val_processed,  # Use original processed dataset, not LazyLLMDataset
-        template=template,
-        processor=processor,  # Pass processor instead of relying on tokenizer parameter
-        num_samples=inference_samples,
-        max_gen_length=512  # Conservative generation length
-    )
-    
-    logger.info(f"Inference callback configured with {inference_samples} validation samples")
-    
     # Clear memory before training
     clear_gpu_memory()
     
@@ -410,16 +275,12 @@ def main():
         template=template,
     )
     
-    # Add the inference callback
-    trainer.add_callback(inference_callback)
-    
     try:
         # Monitor GPU memory during training
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 logger.info(f"GPU {i} memory before training: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
         
-        logger.info("Starting training with inference validation callback...")
         trainer.train()
         
     except Exception as e:
