@@ -61,11 +61,12 @@ class InferenceCallback(TrainerCallback):
         # Pre-select samples to maintain consistency across evaluations
         if self.num_samples > 0:
             np.random.seed(42)  # Fixed seed for reproducible samples
-            self.sample_indices = np.random.choice(
+            indices = np.random.choice(
                 len(self.eval_dataset), 
                 self.num_samples, 
                 replace=False
             )
+            self.sample_indices = [int(idx) for idx in indices]  # Simple conversion to Python ints
     
     def on_evaluate(self, args, state, control, model, **kwargs):
         """Called at the end of evaluation - runs inference on validation samples"""
