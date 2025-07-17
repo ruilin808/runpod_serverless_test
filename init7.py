@@ -7,6 +7,10 @@ NO TEDS WORKING!!!!!!!!
 import os
 import torch
 import gc
+import json
+from typing import List, Dict, Any
+from transformers import TrainerCallback, TrainerControl, TrainerState
+from PIL import Image
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -44,6 +48,223 @@ from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
+
+
+class InferenceCallback(TrainerCallback):
+    """Custom callback to run inference on validation samples after each checkpoint save"""
+    
+    def __init__(self, 
+                 validation_samples: List[Dict], 
+                 template,
+                 num_samples: int = 10,
+                 output_dir: str = "inference_outputs",
+                 save_images: bool = True,
+                 generation_config: Dict = None):
+        """
+        Initialize the inference callback
+        
+        Args:
+            validation_samples: List of validation samples in Swift format
+            template: Swift template for encoding/decoding
+            num_samples: Number of samples to run inference on
+            output_dir: Directory to save inference results
+            save_images: Whether to save images alongside results
+            generation_config: Configuration for text generation
+        """
+        self.validation_samples = validation_samples[:num_samples]  # Take first N samples
+        self.template = template
+        self.num_samples = num_samples
+        self.output_dir = output_dir
+        self.save_images = save_images
+        self.logger = get_logger()
+        
+        # Default generation config
+        self.generation_config = generation_config or {
+            'max_new_tokens': 2048,
+            'temperature': 0.1,
+            'do_sample': True,
+            'top_p': 0.9,
+            'pad_token_id': None,  # Will be set from tokenizer
+        }
+        
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        self.logger.info(f"InferenceCallback initialized with {len(self.validation_samples)} samples")
+    
+    def clear_gpu_memory(self):
+        """Clear GPU memory cache"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+    def save_image(self, image, step: int, sample_idx: int) -> str:
+        """Save PIL image and return filename"""
+        if not self.save_images:
+            return None
+            
+        filename = f"step_{step}_sample_{sample_idx}.png"
+        filepath = os.path.join(self.output_dir, filename)
+        
+        # Convert to PIL Image if needed
+        if hasattr(image, 'save'):
+            image.save(filepath)
+        else:
+            # Handle other image formats
+            Image.fromarray(image).save(filepath)
+        
+        return filename
+    
+    def run_inference_on_sample(self, model, processor, sample: Dict, step: int, sample_idx: int) -> Dict:
+        """Run inference on a single sample"""
+        try:
+            # Prepare the sample for inference
+            # Create user message without the ground truth
+            inference_sample = {
+                'messages': [
+                    {
+                        'role': 'user',
+                        'content': 'Write the HTML representation for this image of a medical table.'
+                    }
+                ],
+                'images': sample['images']
+            }
+            
+            # Switch template to inference mode temporarily
+            original_mode = self.template.mode
+            self.template.set_mode('infer')
+            
+            # Encode the sample
+            encoded = self.template.encode(inference_sample)
+            
+            # Move to device
+            device = next(model.parameters()).device
+            input_ids = torch.tensor([encoded['input_ids']]).to(device)
+            attention_mask = torch.tensor([encoded['attention_mask']]).to(device)
+            
+            # Handle images if present
+            inputs = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+            }
+            
+            # Add image inputs if they exist in encoded sample
+            if 'pixel_values' in encoded:
+                inputs['pixel_values'] = torch.tensor([encoded['pixel_values']]).to(device)
+            if 'image_grid_thw' in encoded:
+                inputs['image_grid_thw'] = torch.tensor([encoded['image_grid_thw']]).to(device)
+            
+            # Set pad_token_id if not set
+            if self.generation_config['pad_token_id'] is None:
+                self.generation_config['pad_token_id'] = processor.tokenizer.eos_token_id
+            
+            # Generate response
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    **self.generation_config
+                )
+            
+            # Decode the generated text
+            generated_text = processor.tokenizer.decode(
+                outputs[0][len(input_ids[0]):], 
+                skip_special_tokens=True
+            )
+            
+            # Restore original template mode
+            self.template.set_mode(original_mode)
+            
+            # Save image if requested
+            image_filename = None
+            if self.save_images and sample['images']:
+                image_filename = self.save_image(sample['images'][0], step, sample_idx)
+            
+            # Ground truth HTML
+            ground_truth = sample['messages'][1]['content']
+            
+            result = {
+                'sample_idx': sample_idx,
+                'step': step,
+                'generated_html': generated_text,
+                'ground_truth_html': ground_truth,
+                'image_filename': image_filename,
+                'input_length': len(input_ids[0]),
+                'output_length': len(outputs[0]) - len(input_ids[0])
+            }
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Inference failed for sample {sample_idx}: {str(e)}")
+            return {
+                'sample_idx': sample_idx,
+                'step': step,
+                'error': str(e),
+                'generated_html': None,
+                'ground_truth_html': sample['messages'][1]['content'] if 'messages' in sample else None
+            }
+    
+    def run_inference(self, model, processor, step: int):
+        """Run inference on all validation samples"""
+        self.logger.info(f"Running inference at step {step} on {len(self.validation_samples)} samples")
+        
+        # Clear memory before inference
+        self.clear_gpu_memory()
+        
+        # Switch model to eval mode
+        model.eval()
+        
+        results = []
+        
+        for idx, sample in enumerate(self.validation_samples):
+            self.logger.info(f"Processing sample {idx + 1}/{len(self.validation_samples)}")
+            
+            result = self.run_inference_on_sample(model, processor, sample, step, idx)
+            results.append(result)
+            
+            # Clear memory after each sample if needed
+            if idx % 5 == 0:  # Every 5 samples
+                self.clear_gpu_memory()
+        
+        # Save results to file
+        results_file = os.path.join(self.output_dir, f"inference_results_step_{step}.json")
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        # Log summary
+        successful_samples = [r for r in results if 'error' not in r]
+        self.logger.info(f"Inference completed: {len(successful_samples)}/{len(results)} samples successful")
+        
+        # Switch back to training mode
+        model.train()
+        
+        # Clear memory after inference
+        self.clear_gpu_memory()
+        
+        return results
+    
+    def on_save(self, args, state: TrainerState, control: TrainerControl, model=None, **kwargs):
+        """Called after each checkpoint save"""
+        try:
+            # Get processor from template
+            processor = self.template.processor
+            
+            # Run inference
+            results = self.run_inference(model, processor, state.global_step)
+            
+            # Log some sample results
+            if results:
+                sample_result = results[0]
+                if 'error' not in sample_result:
+                    self.logger.info(f"Sample inference at step {state.global_step}:")
+                    self.logger.info(f"Generated (first 200 chars): {sample_result['generated_html'][:200]}...")
+                    self.logger.info(f"Ground truth (first 200 chars): {sample_result['ground_truth_html'][:200]}...")
+            
+        except Exception as e:
+            self.logger.error(f"Inference callback failed at step {state.global_step}: {str(e)}")
+            # Don't raise - let training continue
+        
+        return control
 
 
 def create_swift_format_single(sample):
@@ -108,6 +329,30 @@ def clear_gpu_memory():
         gc.collect()
 
 
+def create_inference_callback(val_processed, template, output_dir="inference_outputs"):
+    """Create and return the inference callback"""
+    
+    # Configuration for inference
+    generation_config = {
+        'max_new_tokens': 2048,
+        'temperature': 0.1,
+        'do_sample': True,
+        'top_p': 0.9,
+        'repetition_penalty': 1.1,
+    }
+    
+    callback = InferenceCallback(
+        validation_samples=val_processed,
+        template=template,
+        num_samples=10,  # Adjust based on your needs
+        output_dir=output_dir,
+        save_images=True,
+        generation_config=generation_config
+    )
+    
+    return callback
+
+
 def main():
     """Main training function"""
     
@@ -118,7 +363,7 @@ def main():
     clear_gpu_memory()
     
     # Configuration - Scale parameters based on GPU count
-    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
+    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
     output_dir = 'output'
     data_seed = 42
     
@@ -237,9 +482,8 @@ def main():
     train_processed = raw_dataset['train'].map(create_swift_format_single)
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
-    # Convert to Swift format
-    #train_processed = train_processed.map(create_swift_format_single)
-    #val_processed = val_processed.map(create_swift_format_single)
+    # Convert to list for callback (needed for indexing)
+    val_processed_list = list(val_processed)
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
@@ -264,6 +508,13 @@ def main():
     # Clear memory before training
     clear_gpu_memory()
     
+    # Create inference callback
+    inference_callback = create_inference_callback(
+        val_processed=val_processed_list,  # Use the list version
+        template=template,
+        output_dir=os.path.join(output_dir, "inference_outputs")
+    )
+    
     # Train
     model.enable_input_require_grads()
     trainer = Seq2SeqTrainer(
@@ -273,6 +524,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
+        callbacks=[inference_callback]  # Add the callback here
     )
     
     try:
