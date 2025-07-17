@@ -1,62 +1,14 @@
 #!/usr/bin/env python3
 """
-Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
-NO TEDS WORKING!!!!!!!!
+DeepSpeed ZeRO-3 Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion
+Enhanced with DeepSpeed ZeRO-3 for efficient GPU memory distribution
 """
 
 import os
 import torch
 import gc
-
-# Setup cache directories
-def setup_cache_directories():
-    """Setup cache directory structure"""
-    workspace_dir = "/workspace"
-    cache_dir = os.path.join(workspace_dir, "cache")
-    
-    # Create cache directory structure
-    cache_dirs = {
-        'huggingface': os.path.join(cache_dir, "huggingface"),
-        'modelscope': os.path.join(cache_dir, "modelscope"),
-        'datasets': os.path.join(cache_dir, "datasets"),
-        'torch': os.path.join(cache_dir, "torch")
-    }
-    
-    # Create directories if they don't exist
-    for cache_type, path in cache_dirs.items():
-        os.makedirs(path, exist_ok=True)
-        print(f"Cache directory for {cache_type}: {path}")
-    
-    # Set environment variables for caching
-    os.environ['HF_HOME'] = cache_dirs['huggingface']
-    os.environ['TRANSFORMERS_CACHE'] = cache_dirs['huggingface']
-    os.environ['HF_DATASETS_CACHE'] = cache_dirs['datasets']
-    os.environ['TORCH_HOME'] = cache_dirs['torch']
-    
-    # ModelScope cache (if using ModelScope)
-    os.environ['MODELSCOPE_CACHE'] = cache_dirs['modelscope']
-    
-    # Create additional directories
-    models_dir = os.path.join(workspace_dir, "models")
-    datasets_dir = os.path.join(workspace_dir, "datasets")
-    output_dir = os.path.join(workspace_dir, "output")
-    
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(datasets_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"Models directory: {models_dir}")
-    print(f"Datasets directory: {datasets_dir}")
-    print(f"Output directory: {output_dir}")
-    
-    return {
-        'workspace': workspace_dir,
-        'cache': cache_dir,
-        'models': models_dir,
-        'datasets': datasets_dir,
-        'output': output_dir,
-        **cache_dirs
-    }
+import json
+from typing import Dict, Any
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -83,9 +35,6 @@ def setup_gpus():
         print("No CUDA GPUs available")
         return 0
 
-# Setup cache directories first
-directories = setup_cache_directories()
-
 # Setup GPUs before importing other modules
 gpu_count = setup_gpus()
 
@@ -97,6 +46,111 @@ from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
+
+
+def create_deepspeed_config(gpu_count: int) -> Dict[str, Any]:
+    """Create DeepSpeed ZeRO-3 configuration optimized for multi-GPU setup"""
+    
+    # Base configuration for ZeRO-3
+    config = {
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {
+                "device": "none",  # No CPU offloading as requested
+                "pin_memory": False
+            },
+            "offload_param": {
+                "device": "none",  # No CPU offloading as requested
+                "pin_memory": False
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "sub_group_size": 1e9,
+            "reduce_bucket_size": "auto",
+            "stage3_prefetch_bucket_size": "auto",
+            "stage3_param_persistence_threshold": "auto",
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_gather_16bit_weights_on_model_save": True,
+            "round_robin_gradients": True
+        },
+        "gradient_accumulation_steps": "auto",
+        "gradient_clipping": "auto",
+        "steps_per_print": 10,
+        "train_batch_size": "auto",
+        "train_micro_batch_size_per_gpu": "auto",
+        "wall_clock_breakdown": False,
+        "bf16": {
+            "enabled": "auto"
+        },
+        "fp16": {
+            "enabled": "auto",
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "min_loss_scale": 1
+        },
+        "activation_checkpointing": {
+            "partition_activations": True,
+            "cpu_checkpointing": False,  # Keep on GPU for speed
+            "contiguous_memory_optimization": True,
+            "number_checkpoints": 4,
+            "synchronize_checkpoint_boundary": False,
+            "profile": False
+        },
+        "aio": {
+            "block_size": 1048576,
+            "queue_depth": 8,
+            "thread_count": 1,
+            "single_submit": False,
+            "overlap_events": True
+        },
+        "flops_profiler": {
+            "enabled": False,
+            "profile_step": 1,
+            "module_depth": -1,
+            "top_modules": 1,
+            "detailed": True,
+            "output_file": None
+        }
+    }
+    
+    # Scale configuration based on GPU count
+    if gpu_count >= 8:
+        # High-end multi-GPU setup
+        config["zero_optimization"]["reduce_bucket_size"] = 5e8
+        config["zero_optimization"]["stage3_prefetch_bucket_size"] = 5e8
+        config["zero_optimization"]["stage3_max_live_parameters"] = 3e9
+        config["zero_optimization"]["stage3_max_reuse_distance"] = 3e9
+        config["activation_checkpointing"]["number_checkpoints"] = 8
+    elif gpu_count >= 4:
+        # Medium multi-GPU setup
+        config["zero_optimization"]["reduce_bucket_size"] = 2e8
+        config["zero_optimization"]["stage3_prefetch_bucket_size"] = 2e8
+        config["zero_optimization"]["stage3_max_live_parameters"] = 2e9
+        config["zero_optimization"]["stage3_max_reuse_distance"] = 2e9
+        config["activation_checkpointing"]["number_checkpoints"] = 6
+    else:
+        # Small multi-GPU setup
+        config["zero_optimization"]["reduce_bucket_size"] = 1e8
+        config["zero_optimization"]["stage3_prefetch_bucket_size"] = 1e8
+        config["zero_optimization"]["stage3_max_live_parameters"] = 1e9
+        config["zero_optimization"]["stage3_max_reuse_distance"] = 1e9
+        config["activation_checkpointing"]["number_checkpoints"] = 4
+    
+    return config
+
+
+def save_deepspeed_config(config: Dict[str, Any], output_dir: str) -> str:
+    """Save DeepSpeed configuration to file"""
+    config_path = os.path.join(output_dir, "deepspeed_config.json")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    return config_path
 
 
 def create_swift_format_single(sample):
@@ -131,37 +185,35 @@ def filter_by_length(dataset, template, max_length):
 def truncate_html_content(sample, max_html_chars=None):
     """Truncate HTML content based on available GPU memory"""
     if max_html_chars is None:
-        # Scale HTML length based on GPU count and available memory
+        # With ZeRO-3, we can handle longer sequences due to memory partitioning
         if gpu_count >= 8:
-            max_html_chars = 8000  # More GPUs = can handle longer sequences
+            max_html_chars = 12000  # ZeRO-3 enables longer sequences
         elif gpu_count >= 4:
-            max_html_chars = 6000
+            max_html_chars = 10000
         else:
-            max_html_chars = 4000
+            max_html_chars = 8000
     
     if len(sample['html_table']) > max_html_chars:
         sample['html_table'] = sample['html_table'][:max_html_chars] + "..."
     return sample
 
 
-def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_effective_batch_size=32):
-    """Calculate optimal batch size and gradient accumulation steps for multi-GPU setup"""
-    if gpu_count <= 1:
-        return base_batch_size, target_effective_batch_size // base_batch_size
+def calculate_batch_size_and_accumulation(gpu_count, target_effective_batch_size=64):
+    """Calculate optimal batch size and gradient accumulation steps for DeepSpeed ZeRO-3"""
     
-    # Scale batch size based on GPU count while being conservative about memory
+    # With ZeRO-3, we can afford larger batch sizes due to memory partitioning
     if gpu_count >= 8:
-        # With 8+ GPUs, we can afford slightly larger per-device batch size
-        per_device_batch_size = 2
-        target_effective_batch_size = 64  # Scale up effective batch size
+        # With 8+ GPUs and ZeRO-3, we can use larger batch sizes
+        per_device_batch_size = 4
+        target_effective_batch_size = 128
     elif gpu_count >= 4:
         # With 4+ GPUs, moderate scaling
-        per_device_batch_size = 1
-        target_effective_batch_size = 32
+        per_device_batch_size = 3
+        target_effective_batch_size = 96
     else:
-        # 2-3 GPUs, conservative approach
-        per_device_batch_size = 1
-        target_effective_batch_size = 16
+        # 2-3 GPUs, still conservative but better than without ZeRO-3
+        per_device_batch_size = 2
+        target_effective_batch_size = 64
     
     # Calculate gradient accumulation to maintain effective batch size
     total_batch_size_per_step = per_device_batch_size * gpu_count
@@ -178,7 +230,7 @@ def clear_gpu_memory():
 
 
 def main():
-    """Main training function"""
+    """Main training function with DeepSpeed ZeRO-3"""
     
     logger = get_logger()
     seed_everything(42)
@@ -186,110 +238,110 @@ def main():
     # Clear initial GPU memory
     clear_gpu_memory()
     
-    # Configuration - Scale parameters based on GPU count
-    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
-    output_dir = directories['output']  # Use the workspace output directory
+    # Configuration - Enhanced for ZeRO-3
+    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
+    output_dir = 'output'
     data_seed = 42
     
-    # Scale max_length based on GPU count for better memory distribution
+    # With ZeRO-3, we can handle longer sequences due to parameter partitioning
     if gpu_count >= 8:
-        max_length = 12288  # Can handle longer sequences with more GPUs
+        max_length = 16384  # ZeRO-3 enables longer sequences
     elif gpu_count >= 4:
-        max_length = 10240  # Moderate scaling
+        max_length = 14336
     else:
-        max_length = 8192   # Conservative for 2-3 GPUs
+        max_length = 12288
     
-    # LoRA configuration - Scale based on GPU count
+    # LoRA configuration - Can be more aggressive with ZeRO-3
     if gpu_count >= 8:
-        lora_rank = 8      # Can afford higher rank with more GPUs
-        lora_alpha = 32
+        lora_rank = 16     # Higher rank possible with ZeRO-3
+        lora_alpha = 64
     elif gpu_count >= 4:
-        lora_rank = 6      # Moderate scaling
-        lora_alpha = 24
+        lora_rank = 12
+        lora_alpha = 48
     else:
-        lora_rank = 4      # Conservative for fewer GPUs
-        lora_alpha = 16
+        lora_rank = 8
+        lora_alpha = 32
     
     freeze_llm = False
     freeze_vit = True
     freeze_aligner = True
     
-    # Calculate optimal batch size and gradient accumulation for available GPUs
+    # Calculate optimal batch size for ZeRO-3
     per_device_batch_size, gradient_accumulation_steps = calculate_batch_size_and_accumulation(
-        gpu_count, base_batch_size=1, target_effective_batch_size=32
+        gpu_count, target_effective_batch_size=64
     )
     
-    logger.info(f"Directory Structure:")
-    logger.info(f"  - Workspace: {directories['workspace']}")
-    logger.info(f"  - Cache: {directories['cache']}")
-    logger.info(f"  - Models: {directories['models']}")
-    logger.info(f"  - Datasets: {directories['datasets']}")
-    logger.info(f"  - Output: {directories['output']}")
+    # Create and save DeepSpeed configuration
+    deepspeed_config = create_deepspeed_config(gpu_count)
+    deepspeed_config_path = save_deepspeed_config(deepspeed_config, output_dir)
     
-    logger.info(f"Multi-GPU Scaling Configuration:")
+    logger.info(f"DeepSpeed ZeRO-3 Multi-GPU Configuration:")
     logger.info(f"  - GPUs available: {gpu_count}")
     logger.info(f"  - Per-device batch size: {per_device_batch_size}")
     logger.info(f"  - Gradient accumulation steps: {gradient_accumulation_steps}")
     logger.info(f"  - Effective batch size: {per_device_batch_size * gpu_count * gradient_accumulation_steps}")
     logger.info(f"  - Max sequence length: {max_length}")
     logger.info(f"  - LoRA rank: {lora_rank}, alpha: {lora_alpha}")
+    logger.info(f"  - DeepSpeed config saved to: {deepspeed_config_path}")
     
     # Adjust workers based on GPU count
-    dataloader_workers = min(4, max(2, gpu_count // 2))  # Scale workers with GPUs but cap at 4
+    dataloader_workers = min(8, max(4, gpu_count))  # More workers with ZeRO-3
     
-    # Training arguments - Memory optimized
+    # Training arguments - Enhanced for DeepSpeed ZeRO-3
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
-        learning_rate=1e-4,
+        learning_rate=2e-4,  # Slightly higher LR with larger batch sizes
         per_device_train_batch_size=per_device_batch_size,
         per_device_eval_batch_size=per_device_batch_size,
         gradient_checkpointing=True,
-        weight_decay=0.1,
+        weight_decay=0.01,  # Reduced with ZeRO-3
         lr_scheduler_type='cosine',
-        warmup_ratio=0.05,
+        warmup_ratio=0.03,
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
-        save_steps=100,  # Increased to reduce I/O
+        save_steps=200,
         eval_strategy='steps',
-        eval_steps=100,  # Increased to reduce I/O
+        eval_steps=200,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
-        save_total_limit=3,  # Reduced to save disk space
-        logging_steps=10,  # Increased to reduce overhead
-        dataloader_num_workers=dataloader_workers,  # Scale with GPU count
+        save_total_limit=2,
+        logging_steps=20,
+        dataloader_num_workers=dataloader_workers,
         data_seed=data_seed,
         remove_unused_columns=False,
         max_grad_norm=1.0,
+        # DeepSpeed specific settings
+        deepspeed=deepspeed_config_path,
         # Memory optimization settings
-        dataloader_pin_memory=False,  # Disable to save memory
+        dataloader_pin_memory=True,  # Can enable with ZeRO-3
         ddp_find_unused_parameters=False,
         ddp_timeout=1800,
-        # Additional memory optimizations
-        fp16=True,  # Enable mixed precision training
-        dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
-        ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
-        save_safetensors=True,  # More efficient saving
+        # Mixed precision handled by DeepSpeed
+        bf16=True,  # BF16 often works better with ZeRO-3
+        dataloader_prefetch_factor=4,  # Can increase with ZeRO-3
+        save_safetensors=True,
+        # Additional DeepSpeed optimizations
+        ddp_backend="nccl",
+        sharded_ddp="simple",  # Let DeepSpeed handle sharding
+        prediction_loss_only=True,
     )
     
-    # Load model with memory optimizations
-    logger.info("Loading model with memory optimizations...")
-    logger.info(f"Model will be cached in: {os.environ.get('TRANSFORMERS_CACHE', 'default location')}")
-    
+    # Load model with ZeRO-3 optimizations
+    logger.info("Loading model with DeepSpeed ZeRO-3 optimizations...")
     model, processor = get_model_tokenizer(
         model_id_or_path,
-        torch_dtype=torch.float16,  # Use half precision
-        device_map='auto',  # Let accelerate handle device placement
-        low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
-        cache_dir=directories['huggingface'],  # Explicit cache directory
+        torch_dtype=torch.bfloat16,  # BF16 often works better with ZeRO-3
+        device_map=None,  # Let DeepSpeed handle device placement
+        low_cpu_mem_usage=True,
     )
     
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
     template.set_mode('train')
     template.model = model
     
-    # Setup LoRA with memory-efficient settings
+    # Setup LoRA with enhanced settings for ZeRO-3
     target_modules = get_multimodal_target_regex(model, freeze_llm=freeze_llm, freeze_vit=freeze_vit, 
                                 freeze_aligner=freeze_aligner)
     lora_config = LoraConfig(
@@ -297,8 +349,10 @@ def main():
         r=lora_rank, 
         lora_alpha=lora_alpha,
         target_modules=target_modules,
-        lora_dropout=0.1,  # Add dropout for regularization
-        bias="none",  # Don't adapt bias terms to save memory
+        lora_dropout=0.05,  # Reduced dropout with ZeRO-3
+        bias="none",
+        use_rslora=True,  # Use rank-stabilized LoRA for better performance
+        use_dora=False,  # Disable DoRA for memory efficiency
     )
     model = Swift.prepare_model(model, lora_config)
     
@@ -310,14 +364,9 @@ def main():
     
     # Load and process dataset
     logger.info("Loading dataset...")
-    logger.info(f"Dataset will be cached in: {os.environ.get('HF_DATASETS_CACHE', 'default location')}")
+    raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    raw_dataset = hf_load_dataset(
-        "ruilin808/dataset_1920x1280",
-        cache_dir=directories['datasets']  # Explicit cache directory for datasets
-    )
-    
-    # Apply HTML truncation to reduce sequence length
+    # Apply HTML truncation with enhanced limits for ZeRO-3
     logger.info("Truncating HTML content...")
     train_processed = raw_dataset['train'].map(truncate_html_content)
     val_processed = raw_dataset['validation'].map(truncate_html_content)
@@ -349,7 +398,7 @@ def main():
     # Clear memory before training
     clear_gpu_memory()
     
-    # Train
+    # Train with DeepSpeed ZeRO-3
     model.enable_input_require_grads()
     trainer = Seq2SeqTrainer(
         model=model,
@@ -366,11 +415,16 @@ def main():
             for i in range(torch.cuda.device_count()):
                 logger.info(f"GPU {i} memory before training: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
         
+        logger.info("Starting training with DeepSpeed ZeRO-3...")
         trainer.train()
+        
+        # Monitor GPU memory after training
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                logger.info(f"GPU {i} memory after training: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
-        # Clear memory on failure
         clear_gpu_memory()
         return
     
