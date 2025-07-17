@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
-Enhanced with inference evaluation during training
+Option 1: Custom Evaluation with Compute Metrics and Inference
 """
 
 import os
 import torch
 import gc
-import json
-from typing import Dict, Any, List
 import numpy as np
+from transformers import EvalPrediction
+from collections import defaultdict
+import random
+from typing import Dict, Any, List
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -47,198 +49,6 @@ from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
-from transformers import TrainerCallback
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-
-
-class InferenceEvaluationCallback(TrainerCallback):
-    """Custom callback to run inference on validation samples during training"""
-    
-    def __init__(self, eval_dataset, template, model, processor, num_samples=5, output_dir="output", 
-                 print_full_results=False, print_comparison=True):
-        self.eval_dataset = eval_dataset
-        self.template = template
-        self.model = model
-        self.processor = processor
-        self.num_samples = num_samples
-        self.output_dir = output_dir
-        self.inference_results = []
-        self.print_full_results = print_full_results  # Print full HTML in terminal
-        self.print_comparison = print_comparison      # Print side-by-side comparison
-        
-        # Create inference results directory
-        self.inference_dir = os.path.join(output_dir, "inference_results")
-        os.makedirs(self.inference_dir, exist_ok=True)
-    
-    def print_separator(self, title="", width=80):
-        """Print a formatted separator line"""
-        if title:
-            separator = f"{'='*10} {title} {'='*(width-len(title)-12)}"
-        else:
-            separator = "="*width
-        print(separator)
-    
-    def print_html_comparison(self, ground_truth, prediction, sample_idx):
-        """Print a formatted comparison of ground truth vs prediction"""
-        print(f"\n📊 SAMPLE {sample_idx} - HTML COMPARISON")
-        print("─" * 80)
-        
-        # Basic stats
-        gt_len = len(ground_truth)
-        pred_len = len(prediction)
-        print(f"📏 Length: GT={gt_len} chars | Pred={pred_len} chars | Diff={pred_len-gt_len:+d}")
-        
-        # HTML tag counts (basic analysis)
-        gt_table_count = ground_truth.count('<table')
-        pred_table_count = prediction.count('<table')
-        gt_tr_count = ground_truth.count('<tr')
-        pred_tr_count = prediction.count('<tr')
-        gt_td_count = ground_truth.count('<td')
-        pred_td_count = prediction.count('<td')
-        
-        print(f"🏷️  Tags: <table> GT={gt_table_count} Pred={pred_table_count} | <tr> GT={gt_tr_count} Pred={pred_tr_count} | <td> GT={gt_td_count} Pred={pred_td_count}")
-        
-        if self.print_comparison:
-            print("\n🎯 GROUND TRUTH (first 300 chars):")
-            print("┌" + "─" * 78 + "┐")
-            gt_preview = ground_truth[:300] + "..." if len(ground_truth) > 300 else ground_truth
-            for line in gt_preview.split('\n'):
-                print(f"│ {line[:76]:<76} │")
-            print("└" + "─" * 78 + "┘")
-            
-            print("\n🤖 PREDICTION (first 300 chars):")
-            print("┌" + "─" * 78 + "┐")
-            pred_preview = prediction[:300] + "..." if len(prediction) > 300 else prediction
-            for line in pred_preview.split('\n'):
-                print(f"│ {line[:76]:<76} │")
-            print("└" + "─" * 78 + "┘")
-        
-        if self.print_full_results:
-            print("\n📋 FULL GROUND TRUTH:")
-            print("─" * 40)
-            print(ground_truth)
-            print("\n📋 FULL PREDICTION:")
-            print("─" * 40)
-            print(prediction)
-    
-    def on_evaluate(self, args, state, control, **kwargs):
-        """Run inference when evaluation is triggered"""
-        if state.global_step == 0:
-            return
-            
-        logger = get_logger()
-        
-        # Print evaluation header
-        self.print_separator(f"INFERENCE EVALUATION - STEP {state.global_step}")
-        print(f"🚀 Running inference on {self.num_samples} validation samples...")
-        print(f"⏰ Step: {state.global_step} | Epoch: {state.epoch:.2f}")
-        
-        # Set model to eval mode
-        self.model.eval()
-        
-        # Select random samples for inference
-        sample_indices = np.random.choice(
-            len(self.eval_dataset.dataset), 
-            min(self.num_samples, len(self.eval_dataset.dataset)), 
-            replace=False
-        )
-        
-        inference_results = []
-        
-        with torch.no_grad():
-            for i, idx in enumerate(sample_indices):
-                try:
-                    # Convert numpy.int64 to regular Python int
-                    idx = int(idx)
-                    print(f"\n🔄 Processing sample {i+1}/{len(sample_indices)} (dataset idx: {idx})...")
-                    
-                    # Get the original sample
-                    sample = self.eval_dataset.dataset[idx]
-                    
-                    # Prepare input for generation
-                    messages = [
-                        {
-                            'role': 'user',
-                            'content': 'Write the HTML representation for this image of a medical table.'
-                        }
-                    ]
-                    
-                    # Create generation input
-                    generation_input = {
-                        'messages': messages,
-                        'images': sample['images']
-                    }
-                    
-                    print("⚡ Generating prediction...")
-                    
-                    # Generate prediction
-                    generated_ids = self.template.generate(
-                        generation_input,
-                        max_new_tokens=2048,
-                        do_sample=False,
-                        temperature=0.0,
-                        top_p=1.0,
-                        num_beams=1,
-                        pad_token_id=self.processor.tokenizer.eos_token_id,
-                    )
-                    
-                    # Decode prediction
-                    prediction = self.processor.tokenizer.decode(
-                        generated_ids[0], 
-                        skip_special_tokens=True
-                    )
-                    
-                    # Get ground truth
-                    ground_truth = sample['messages'][1]['content']  # Assistant's response
-                    
-                    # Store results
-                    result = {
-                        'step': state.global_step,
-                        'sample_idx': int(idx),
-                        'ground_truth': ground_truth,
-                        'prediction': prediction,
-                        'ground_truth_length': len(ground_truth),
-                        'prediction_length': len(prediction)
-                    }
-                    
-                    inference_results.append(result)
-                    
-                    # Print detailed comparison
-                    self.print_html_comparison(ground_truth, prediction, idx)
-                    
-                    print(f"✅ Sample {i+1} completed!")
-                    
-                except Exception as e:
-                    print(f"❌ Error during inference on sample {idx}: {str(e)}")
-                    logger.error(f"Error during inference on sample {idx}: {str(e)}")
-                    continue
-        
-        # Print summary
-        self.print_separator("INFERENCE SUMMARY")
-        successful_samples = len(inference_results)
-        avg_gt_length = sum(r['ground_truth_length'] for r in inference_results) / max(1, successful_samples)
-        avg_pred_length = sum(r['prediction_length'] for r in inference_results) / max(1, successful_samples)
-        
-        print(f"📈 Results Summary:")
-        print(f"   • Successful samples: {successful_samples}/{self.num_samples}")
-        print(f"   • Average GT length: {avg_gt_length:.0f} chars")
-        print(f"   • Average prediction length: {avg_pred_length:.0f} chars")
-        print(f"   • Length difference: {avg_pred_length - avg_gt_length:+.0f} chars")
-        
-        # Save inference results
-        results_file = os.path.join(self.inference_dir, f"inference_step_{state.global_step}.json")
-        with open(results_file, 'w') as f:
-            json.dump(inference_results, f, indent=2)
-        
-        # Store in callback for later analysis
-        self.inference_results.extend(inference_results)
-        
-        # Set model back to train mode
-        self.model.train()
-        
-        print(f"💾 Results saved to: {results_file}")
-        self.print_separator("INFERENCE COMPLETE")
-        print()  # Add spacing before training continues
 
 
 def create_swift_format_single(sample):
@@ -301,6 +111,247 @@ def clear_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
+
+
+def calculate_text_similarity_metrics(predictions: List[str], references: List[str]) -> Dict[str, float]:
+    """Calculate text similarity metrics between predictions and references"""
+    try:
+        from rouge_score import rouge_scorer
+        from nltk.translate.bleu_score import sentence_bleu
+        from nltk.tokenize import word_tokenize
+        
+        # Initialize ROUGE scorer
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        
+        # Calculate ROUGE scores
+        rouge_scores = defaultdict(list)
+        bleu_scores = []
+        
+        for pred, ref in zip(predictions, references):
+            # ROUGE scores
+            scores = scorer.score(ref, pred)
+            for key, score in scores.items():
+                rouge_scores[f'{key}_f1'].append(score.fmeasure)
+            
+            # BLEU score
+            try:
+                ref_tokens = word_tokenize(ref.lower())
+                pred_tokens = word_tokenize(pred.lower())
+                bleu = sentence_bleu([ref_tokens], pred_tokens)
+                bleu_scores.append(bleu)
+            except:
+                bleu_scores.append(0.0)
+        
+        # Average scores
+        metrics = {key: np.mean(values) for key, values in rouge_scores.items()}
+        metrics['bleu'] = np.mean(bleu_scores)
+        
+        return metrics
+        
+    except ImportError:
+        # Fallback to simple metrics if ROUGE/NLTK not available
+        return {
+            'char_similarity': np.mean([
+                len(set(pred) & set(ref)) / len(set(pred) | set(ref)) if pred and ref else 0.0
+                for pred, ref in zip(predictions, references)
+            ])
+        }
+
+
+def calculate_html_quality_metrics(predictions: List[str]) -> Dict[str, float]:
+    """Calculate HTML-specific quality metrics"""
+    metrics = {
+        'has_table_tag': 0.0,
+        'has_complete_table': 0.0,
+        'has_tr_tag': 0.0,
+        'has_td_tag': 0.0,
+        'avg_html_length': 0.0,
+        'valid_html_structure': 0.0
+    }
+    
+    if not predictions:
+        return metrics
+    
+    total_length = 0
+    
+    for pred in predictions:
+        pred_lower = pred.lower()
+        total_length += len(pred)
+        
+        # Check for HTML tags
+        if '<table' in pred_lower:
+            metrics['has_table_tag'] += 1
+        
+        if '<table' in pred_lower and '</table>' in pred_lower:
+            metrics['has_complete_table'] += 1
+        
+        if '<tr' in pred_lower:
+            metrics['has_tr_tag'] += 1
+        
+        if '<td' in pred_lower:
+            metrics['has_td_tag'] += 1
+        
+        # Simple structure validation
+        if ('<table' in pred_lower and '</table>' in pred_lower and 
+            '<tr' in pred_lower and '<td' in pred_lower):
+            metrics['valid_html_structure'] += 1
+    
+    # Convert to percentages
+    n_samples = len(predictions)
+    for key in ['has_table_tag', 'has_complete_table', 'has_tr_tag', 'has_td_tag', 'valid_html_structure']:
+        metrics[key] = metrics[key] / n_samples
+    
+    metrics['avg_html_length'] = total_length / n_samples
+    
+    return metrics
+
+
+class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+    """Custom trainer that performs inference during evaluation"""
+    
+    def __init__(self, *args, **kwargs):
+        # Extract custom parameters
+        self.inference_samples = kwargs.pop('inference_samples', 3)
+        self.val_dataset_raw = kwargs.pop('val_dataset_raw', None)
+        self.processor = kwargs.pop('processor', None)
+        self.template = kwargs.pop('template', None)
+        self.logger = kwargs.pop('logger', None)
+        
+        # Select random samples for consistent evaluation
+        if self.val_dataset_raw:
+            self.eval_samples = random.sample(
+                list(self.val_dataset_raw), 
+                min(self.inference_samples, len(self.val_dataset_raw))
+            )
+        else:
+            self.eval_samples = []
+        
+        super().__init__(*args, **kwargs)
+    
+    def compute_metrics(self, eval_preds: EvalPrediction) -> Dict[str, Any]:
+        """Custom compute_metrics with inference and quality assessment"""
+        predictions, labels = eval_preds.predictions, eval_preds.label_ids
+        
+        # Replace -100 with pad_token_id for decoding
+        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
+        predictions = np.where(predictions != -100, predictions, self.tokenizer.pad_token_id)
+        
+        # Decode predictions and labels
+        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        
+        # Calculate text similarity metrics
+        similarity_metrics = calculate_text_similarity_metrics(decoded_preds, decoded_labels)
+        
+        # Calculate HTML quality metrics
+        html_metrics = calculate_html_quality_metrics(decoded_preds)
+        
+        # Combine metrics
+        metrics = {**similarity_metrics, **html_metrics}
+        
+        # Run inference on selected samples
+        if self.eval_samples and self.logger:
+            self.run_inference_evaluation()
+        
+        return metrics
+    
+    def run_inference_evaluation(self):
+        """Run inference on selected validation samples"""
+        self.logger.info(f"\n{'='*70}")
+        self.logger.info(f"INFERENCE EVALUATION - Step {self.state.global_step}")
+        self.logger.info(f"{'='*70}")
+        
+        # Set model to eval mode
+        self.model.eval()
+        
+        with torch.no_grad():
+            for i, sample in enumerate(self.eval_samples):
+                try:
+                    # Prepare input
+                    messages = sample['messages']
+                    user_message = messages[0]['content']
+                    expected_output = messages[1]['content']
+                    
+                    # Create input for generation
+                    gen_input = {
+                        'messages': [{'role': 'user', 'content': user_message}],
+                        'images': sample['images']
+                    }
+                    
+                    # Encode input
+                    inputs = self.template.encode(gen_input)
+                    
+                    # Move to device
+                    input_ids = torch.tensor(inputs['input_ids']).unsqueeze(0).to(self.model.device)
+                    attention_mask = torch.tensor(inputs['attention_mask']).unsqueeze(0).to(self.model.device)
+                    
+                    # Generate with mixed precision
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=512,
+                            do_sample=True,
+                            temperature=0.7,
+                            top_p=0.9,
+                            repetition_penalty=1.1,
+                            pad_token_id=self.processor.tokenizer.eos_token_id,
+                            eos_token_id=self.processor.tokenizer.eos_token_id
+                        )
+                    
+                    # Decode only the generated part (exclude input)
+                    generated_tokens = outputs[0][input_ids.shape[-1]:]
+                    generated_text = self.processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                    
+                    # Log comparison
+                    self.logger.info(f"\n--- Sample {i+1} ---")
+                    self.logger.info(f"Query: {user_message}")
+                    self.logger.info(f"Expected: {expected_output[:300]}{'...' if len(expected_output) > 300 else ''}")
+                    self.logger.info(f"Generated: {generated_text[:300]}{'...' if len(generated_text) > 300 else ''}")
+                    
+                    # Quality checks
+                    quality_checks = []
+                    gen_lower = generated_text.lower()
+                    
+                    if "<table" in gen_lower:
+                        quality_checks.append("✓ Contains <table>")
+                    else:
+                        quality_checks.append("✗ Missing <table>")
+                    
+                    if "</table>" in gen_lower:
+                        quality_checks.append("✓ Contains </table>")
+                    else:
+                        quality_checks.append("✗ Missing </table>")
+                    
+                    if "<tr" in gen_lower:
+                        quality_checks.append("✓ Contains <tr>")
+                    else:
+                        quality_checks.append("✗ Missing <tr>")
+                    
+                    if "<td" in gen_lower:
+                        quality_checks.append("✓ Contains <td>")
+                    else:
+                        quality_checks.append("✗ Missing <td>")
+                    
+                    self.logger.info(f"Quality: {', '.join(quality_checks)}")
+                    
+                    # Save sample output
+                    output_dir = os.path.join(self.args.output_dir, f"inference_step_{self.state.global_step}")
+                    os.makedirs(output_dir, exist_ok=True)
+                    
+                    output_file = os.path.join(output_dir, f"sample_{i+1}.html")
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(f"<!-- Step {self.state.global_step} - Sample {i+1} -->\n")
+                        f.write(f"<!-- Expected Output -->\n{expected_output}\n\n")
+                        f.write(f"<!-- Generated Output -->\n{generated_text}\n")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error during inference on sample {i+1}: {e}")
+                    continue
+        
+        # Return model to training mode
+        self.model.train()
+        self.logger.info(f"{'='*70}\n")
 
 
 def main():
@@ -374,7 +425,7 @@ def main():
         eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
-        metric_for_best_model='loss',
+        metric_for_best_model='rouge1_f1',  # Use ROUGE-1 F1 as best metric
         save_total_limit=3,  # Reduced to save disk space
         logging_steps=10,  # Increased to reduce overhead
         dataloader_num_workers=dataloader_workers,  # Scale with GPU count
@@ -390,6 +441,8 @@ def main():
         dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
         ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
         save_safetensors=True,  # More efficient saving
+        load_best_model_at_end=True,  # Load best model at end
+        greater_is_better=True,  # Higher ROUGE score is better
     )
     
     # Load model with memory optimizations
@@ -428,7 +481,7 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply HTML truncation to reduce sequence length
+    # Apply Swift format transformation
     train_processed = raw_dataset['train'].map(create_swift_format_single)
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
@@ -455,28 +508,21 @@ def main():
     # Clear memory before training
     clear_gpu_memory()
     
-    # Create inference evaluation callback
-    inference_callback = InferenceEvaluationCallback(
-        eval_dataset=val_dataset,
-        template=template,
-        model=model,
-        processor=processor,
-        num_samples=5,  # Number of samples to run inference on
-        output_dir=output_dir,
-        print_full_results=False,  # Set to True to print full HTML in terminal
-        print_comparison=True      # Set to False to disable side-by-side comparison
-    )
-    
-    # Train
+    # Train with custom trainer
     model.enable_input_require_grads()
-    trainer = Seq2SeqTrainer(
+    trainer = CustomSeq2SeqTrainer(
         model=model,
         args=training_args,
         data_collator=template.data_collator,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
-        callbacks=[inference_callback],  # Add the inference callback
+        tokenizer=processor.tokenizer,
+        # Custom parameters for inference
+        inference_samples=3,
+        val_dataset_raw=val_processed,
+        processor=processor,
+        logger=logger,
     )
     
     try:
@@ -486,13 +532,6 @@ def main():
                 logger.info(f"GPU {i} memory before training: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
         
         trainer.train()
-        
-        # Save final inference results summary
-        final_results_file = os.path.join(output_dir, "final_inference_summary.json")
-        with open(final_results_file, 'w') as f:
-            json.dump(inference_callback.inference_results, f, indent=2)
-        
-        logger.info(f"Final inference results saved to {final_results_file}")
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
@@ -505,7 +544,7 @@ def main():
     os.makedirs(visual_loss_dir, exist_ok=True)
     plot_images(visual_loss_dir, training_args.logging_dir, ['train/loss'], 0.9)
     
-    logger.info(f'Training complete. Model saved to: {trainer.state.last_model_checkpoint}')
+    logger.info(f'Training complete. Model saved to: {trainer.state.best_model_checkpoint}')
     
     # Final memory cleanup
     clear_gpu_memory()
