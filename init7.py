@@ -20,6 +20,16 @@ def setup_gpus():
         # Set memory management for better allocation
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         
+        # Setup for DeepSpeed distributed training
+        if 'RANK' not in os.environ and 'LOCAL_RANK' not in os.environ:
+            # Not launched with DeepSpeed launcher, set up single-node multi-GPU
+            print("Setting up single-node multi-GPU environment for DeepSpeed")
+            os.environ['RANK'] = '0'
+            os.environ['LOCAL_RANK'] = '0'
+            os.environ['WORLD_SIZE'] = str(gpu_count)
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = '29500'
+        
         if gpu_count > 1:
             # Use all available GPUs
             gpu_ids = ','.join(str(i) for i in range(gpu_count))
@@ -48,8 +58,11 @@ from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
 
 
-def create_deepspeed_config(gpu_count: int) -> Dict[str, Any]:
+def create_deepspeed_config(gpu_count: int, use_deepspeed: bool = True) -> Dict[str, Any]:
     """Create DeepSpeed ZeRO-3 configuration optimized for multi-GPU setup"""
+    
+    if not use_deepspeed:
+        return None
     
     # Base configuration for ZeRO-3
     config = {
@@ -229,11 +242,58 @@ def clear_gpu_memory():
         gc.collect()
 
 
+def check_training_args_compatibility():
+    """Check which training arguments are supported"""
+    from swift.trainers import Seq2SeqTrainingArguments
+    import inspect
+    
+    # Get the signature of Seq2SeqTrainingArguments
+    sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+    supported_params = set(sig.parameters.keys())
+    
+    # Parameters we want to use
+    desired_params = {
+        'deepspeed', 'bf16', 'fp16', 'dataloader_prefetch_factor', 
+        'ddp_backend', 'sharded_ddp', 'prediction_loss_only'
+    }
+    
+    unsupported = desired_params - supported_params
+    if unsupported:
+        print(f"Warning: Unsupported training arguments: {unsupported}")
+    
+    return supported_params
+
+
 def main():
     """Main training function with DeepSpeed ZeRO-3"""
     
     logger = get_logger()
     seed_everything(42)
+    
+    # Check compatibility and decide whether to use DeepSpeed
+    supported_params = check_training_args_compatibility()
+    
+    # Determine if we should use DeepSpeed
+    use_deepspeed = ('deepspeed' in supported_params and 
+                    'RANK' in os.environ and 
+                    gpu_count > 1)
+    
+    if not use_deepspeed:
+        logger.warning("DeepSpeed not available or not in distributed mode. Using standard DDP.")
+        # Adjust parameters for non-DeepSpeed training
+        if gpu_count >= 4:
+            max_length = 10240
+            lora_rank = 6
+            lora_alpha = 24
+            per_device_batch_size = 1
+        else:
+            max_length = 8192
+            lora_rank = 4
+            lora_alpha = 16
+            per_device_batch_size = 1
+        
+        # Recalculate gradient accumulation for non-DeepSpeed
+        gradient_accumulation_steps = max(1, 32 // (per_device_batch_size * gpu_count))
     
     # Clear initial GPU memory
     clear_gpu_memory()
@@ -272,67 +332,96 @@ def main():
     )
     
     # Create and save DeepSpeed configuration
-    deepspeed_config = create_deepspeed_config(gpu_count)
-    deepspeed_config_path = save_deepspeed_config(deepspeed_config, output_dir)
+    deepspeed_config = create_deepspeed_config(gpu_count, use_deepspeed)
+    deepspeed_config_path = None
     
-    logger.info(f"DeepSpeed ZeRO-3 Multi-GPU Configuration:")
+    if use_deepspeed and deepspeed_config:
+        deepspeed_config_path = save_deepspeed_config(deepspeed_config, output_dir)
+        logger.info(f"DeepSpeed ZeRO-3 Multi-GPU Configuration:")
+        logger.info(f"  - DeepSpeed config saved to: {deepspeed_config_path}")
+    else:
+        logger.info(f"Standard Multi-GPU DDP Configuration:")
+    
     logger.info(f"  - GPUs available: {gpu_count}")
     logger.info(f"  - Per-device batch size: {per_device_batch_size}")
     logger.info(f"  - Gradient accumulation steps: {gradient_accumulation_steps}")
     logger.info(f"  - Effective batch size: {per_device_batch_size * gpu_count * gradient_accumulation_steps}")
     logger.info(f"  - Max sequence length: {max_length}")
     logger.info(f"  - LoRA rank: {lora_rank}, alpha: {lora_alpha}")
-    logger.info(f"  - DeepSpeed config saved to: {deepspeed_config_path}")
+    logger.info(f"  - Using DeepSpeed: {use_deepspeed}")
     
     # Adjust workers based on GPU count
     dataloader_workers = min(8, max(4, gpu_count))  # More workers with ZeRO-3
     
-    # Training arguments - Enhanced for DeepSpeed ZeRO-3
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=output_dir,
-        learning_rate=2e-4,  # Slightly higher LR with larger batch sizes
-        per_device_train_batch_size=per_device_batch_size,
-        per_device_eval_batch_size=per_device_batch_size,
-        gradient_checkpointing=True,
-        weight_decay=0.01,  # Reduced with ZeRO-3
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.03,
-        report_to=['tensorboard'],
-        logging_first_step=True,
-        save_strategy='steps',
-        save_steps=200,
-        eval_strategy='steps',
-        eval_steps=200,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        num_train_epochs=3,
-        metric_for_best_model='loss',
-        save_total_limit=2,
-        logging_steps=20,
-        dataloader_num_workers=dataloader_workers,
-        data_seed=data_seed,
-        remove_unused_columns=False,
-        max_grad_norm=1.0,
-        # DeepSpeed specific settings
-        deepspeed=deepspeed_config_path,
-        # Memory optimization settings
-        dataloader_pin_memory=True,  # Can enable with ZeRO-3
-        ddp_find_unused_parameters=False,
-        ddp_timeout=1800,
-        # Mixed precision handled by DeepSpeed
-        bf16=True,  # BF16 often works better with ZeRO-3
-        dataloader_prefetch_factor=4,  # Can increase with ZeRO-3
-        save_safetensors=True,
-        # Additional DeepSpeed optimizations
-        ddp_backend="nccl",
-    )
+    # Create training arguments with compatibility checking
+    training_args_dict = {
+        'output_dir': output_dir,
+        'learning_rate': 2e-4,
+        'per_device_train_batch_size': per_device_batch_size,
+        'per_device_eval_batch_size': per_device_batch_size,
+        'gradient_checkpointing': True,
+        'weight_decay': 0.01,
+        'lr_scheduler_type': 'cosine',
+        'warmup_ratio': 0.03,
+        'report_to': ['tensorboard'],
+        'logging_first_step': True,
+        'save_strategy': 'steps',
+        'save_steps': 200,
+        'eval_strategy': 'steps',
+        'eval_steps': 200,
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'num_train_epochs': 3,
+        'metric_for_best_model': 'loss',
+        'save_total_limit': 2,
+        'logging_steps': 20,
+        'dataloader_num_workers': dataloader_workers,
+        'data_seed': data_seed,
+        'remove_unused_columns': False,
+        'max_grad_norm': 1.0,
+        'dataloader_pin_memory': True,
+        'ddp_find_unused_parameters': False,
+        'ddp_timeout': 1800,
+        'save_safetensors': True,
+    }
     
-    # Load model with ZeRO-3 optimizations
-    logger.info("Loading model with DeepSpeed ZeRO-3 optimizations...")
+    # Add DeepSpeed config if supported and available
+    if 'deepspeed' in supported_params and use_deepspeed and deepspeed_config_path:
+        training_args_dict['deepspeed'] = deepspeed_config_path
+        logger.info("DeepSpeed configuration enabled")
+    else:
+        logger.info("Using standard DDP training")
+    
+    # Add mixed precision if supported
+    if 'bf16' in supported_params:
+        training_args_dict['bf16'] = True
+    elif 'fp16' in supported_params:
+        training_args_dict['fp16'] = True
+        logger.info("Using FP16 instead of BF16")
+    
+    # Add other optional parameters if supported
+    if 'dataloader_prefetch_factor' in supported_params:
+        training_args_dict['dataloader_prefetch_factor'] = 4
+    
+    if 'ddp_backend' in supported_params:
+        training_args_dict['ddp_backend'] = "nccl"
+    
+    # Training arguments - Enhanced for DeepSpeed ZeRO-3
+    training_args = Seq2SeqTrainingArguments(**training_args_dict)
+    
+    # Load model with appropriate optimizations
+    logger.info("Loading model with optimizations...")
+    model_kwargs = {
+        'torch_dtype': torch.bfloat16 if use_deepspeed else torch.float16,
+        'low_cpu_mem_usage': True,
+    }
+    
+    # Only set device_map to None for DeepSpeed, otherwise use auto
+    if not use_deepspeed:
+        model_kwargs['device_map'] = 'auto'
+    
     model, processor = get_model_tokenizer(
         model_id_or_path,
-        torch_dtype=torch.bfloat16,  # BF16 often works better with ZeRO-3
-        device_map=None,  # Let DeepSpeed handle device placement
-        low_cpu_mem_usage=True,
+        **model_kwargs
     )
     
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
