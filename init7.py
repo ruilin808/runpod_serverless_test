@@ -148,6 +148,8 @@ class InferenceEvaluationCallback(TrainerCallback):
         with torch.no_grad():
             for i, idx in enumerate(sample_indices):
                 try:
+                    # Convert numpy.int64 to regular Python int
+                    idx = int(idx)
                     print(f"\n🔄 Processing sample {i+1}/{len(sample_indices)} (dataset idx: {idx})...")
                     
                     # Get the original sample
@@ -369,7 +371,7 @@ def main():
         save_strategy='steps',
         save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=2,  # Increased to reduce I/O
+        eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
@@ -460,7 +462,9 @@ def main():
         model=model,
         processor=processor,
         num_samples=5,  # Number of samples to run inference on
-        output_dir=output_dir
+        output_dir=output_dir,
+        print_full_results=False,  # Set to True to print full HTML in terminal
+        print_comparison=True      # Set to False to disable side-by-side comparison
     )
     
     # Train
