@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
 Memory-Optimized Qwen2-VL Fine-tuning Script for Table HTML Conversion with Multi-GPU Support
-Option 1: Custom Evaluation with Compute Metrics and Inference
+NO TEDS WORKING!!!!!!!!
 """
 
 import os
 import torch
 import gc
 import numpy as np
-from transformers import EvalPrediction
-from collections import defaultdict
-import random
-from typing import Dict, Any, List
+from transformers import TrainerCallback
 
 # Auto-detect and use all available GPUs
 def setup_gpus():
@@ -49,6 +46,110 @@ from swift.utils import get_logger, get_model_parameter_info, plot_images, seed_
 from swift.tuners import Swift, LoraConfig
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset as hf_load_dataset
+
+
+class InferenceCallback(TrainerCallback):
+    """Callback to run inference on validation samples during evaluation"""
+    
+    def __init__(self, eval_dataset, template, num_samples=3, max_gen_length=512):
+        self.eval_dataset = eval_dataset
+        self.template = template
+        self.num_samples = min(num_samples, len(eval_dataset)) if len(eval_dataset) > 0 else 0
+        self.max_gen_length = max_gen_length
+        
+        # Pre-select samples to maintain consistency across evaluations
+        if self.num_samples > 0:
+            np.random.seed(42)  # Fixed seed for reproducible samples
+            self.sample_indices = np.random.choice(
+                len(self.eval_dataset), 
+                self.num_samples, 
+                replace=False
+            )
+    
+    def on_evaluate(self, args, state, control, model, tokenizer, eval_dataloader, **kwargs):
+        """Called at the end of evaluation - runs inference on validation samples"""
+        
+        # Only run on main process to avoid duplicated output
+        if args.local_rank not in [-1, 0]:
+            return
+            
+        # Skip if no samples to evaluate
+        if self.num_samples == 0:
+            return
+            
+        try:
+            print(f"\n🔍 Running inference validation at step {state.global_step}")
+            print("=" * 70)
+            
+            # Ensure model is in eval mode
+            model.eval()
+            
+            with torch.no_grad():
+                for i, idx in enumerate(self.sample_indices):
+                    try:
+                        sample = self.eval_dataset[idx]
+                        
+                        # Prepare input (just the user message for inference)
+                        user_message = sample['messages'][0]['content']
+                        inference_sample = {
+                            'messages': [{'role': 'user', 'content': user_message}],
+                            'images': sample.get('images', [])
+                        }
+                        
+                        # Encode input
+                        inputs = self.template.encode(inference_sample)
+                        
+                        # Move to device and add batch dimension
+                        input_ids = inputs['input_ids'].unsqueeze(0).to(model.device)
+                        attention_mask = inputs['attention_mask'].unsqueeze(0).to(model.device)
+                        
+                        # Generate with conservative settings
+                        outputs = model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_length=min(self.max_gen_length, len(inputs['input_ids']) + 256),
+                            do_sample=False,  # Deterministic
+                            num_beams=1,      # Faster than beam search
+                            pad_token_id=tokenizer.pad_token_id,
+                            eos_token_id=tokenizer.eos_token_id,
+                        )
+                        
+                        # Decode prediction (remove input tokens)
+                        generated_tokens = outputs[0][len(input_ids[0]):]
+                        predicted_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                        
+                        # Get ground truth
+                        ground_truth = sample['messages'][1]['content']
+                        
+                        # Display results
+                        print(f"\n--- Validation Sample {i+1} (Index: {idx}) ---")
+                        print(f"Input: {user_message}")
+                        print(f"Prediction: {predicted_text[:300]}{'...' if len(predicted_text) > 300 else ''}")
+                        print(f"Ground Truth: {ground_truth[:300]}{'...' if len(ground_truth) > 300 else ''}")
+                        
+                        # Simple quality check
+                        if predicted_text.strip():
+                            print(f"✅ Generated non-empty response")
+                        else:
+                            print(f"❌ Generated empty response")
+                            
+                    except Exception as e:
+                        print(f"❌ Failed to process sample {idx}: {e}")
+                        continue
+                        
+            print("=" * 70)
+            print(f"✅ Inference validation completed at step {state.global_step}\n")
+            
+        except Exception as e:
+            print(f"❌ Inference callback failed: {e}")
+            # Training continues normally
+        
+        finally:
+            # Ensure we're back in training mode
+            model.train()
+            # Clear any accumulated memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def create_swift_format_single(sample):
@@ -111,247 +212,6 @@ def clear_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
-
-
-def calculate_text_similarity_metrics(predictions: List[str], references: List[str]) -> Dict[str, float]:
-    """Calculate text similarity metrics between predictions and references"""
-    try:
-        from rouge_score import rouge_scorer
-        from nltk.translate.bleu_score import sentence_bleu
-        from nltk.tokenize import word_tokenize
-        
-        # Initialize ROUGE scorer
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-        
-        # Calculate ROUGE scores
-        rouge_scores = defaultdict(list)
-        bleu_scores = []
-        
-        for pred, ref in zip(predictions, references):
-            # ROUGE scores
-            scores = scorer.score(ref, pred)
-            for key, score in scores.items():
-                rouge_scores[f'{key}_f1'].append(score.fmeasure)
-            
-            # BLEU score
-            try:
-                ref_tokens = word_tokenize(ref.lower())
-                pred_tokens = word_tokenize(pred.lower())
-                bleu = sentence_bleu([ref_tokens], pred_tokens)
-                bleu_scores.append(bleu)
-            except:
-                bleu_scores.append(0.0)
-        
-        # Average scores
-        metrics = {key: np.mean(values) for key, values in rouge_scores.items()}
-        metrics['bleu'] = np.mean(bleu_scores)
-        
-        return metrics
-        
-    except ImportError:
-        # Fallback to simple metrics if ROUGE/NLTK not available
-        return {
-            'char_similarity': np.mean([
-                len(set(pred) & set(ref)) / len(set(pred) | set(ref)) if pred and ref else 0.0
-                for pred, ref in zip(predictions, references)
-            ])
-        }
-
-
-def calculate_html_quality_metrics(predictions: List[str]) -> Dict[str, float]:
-    """Calculate HTML-specific quality metrics"""
-    metrics = {
-        'has_table_tag': 0.0,
-        'has_complete_table': 0.0,
-        'has_tr_tag': 0.0,
-        'has_td_tag': 0.0,
-        'avg_html_length': 0.0,
-        'valid_html_structure': 0.0
-    }
-    
-    if not predictions:
-        return metrics
-    
-    total_length = 0
-    
-    for pred in predictions:
-        pred_lower = pred.lower()
-        total_length += len(pred)
-        
-        # Check for HTML tags
-        if '<table' in pred_lower:
-            metrics['has_table_tag'] += 1
-        
-        if '<table' in pred_lower and '</table>' in pred_lower:
-            metrics['has_complete_table'] += 1
-        
-        if '<tr' in pred_lower:
-            metrics['has_tr_tag'] += 1
-        
-        if '<td' in pred_lower:
-            metrics['has_td_tag'] += 1
-        
-        # Simple structure validation
-        if ('<table' in pred_lower and '</table>' in pred_lower and 
-            '<tr' in pred_lower and '<td' in pred_lower):
-            metrics['valid_html_structure'] += 1
-    
-    # Convert to percentages
-    n_samples = len(predictions)
-    for key in ['has_table_tag', 'has_complete_table', 'has_tr_tag', 'has_td_tag', 'valid_html_structure']:
-        metrics[key] = metrics[key] / n_samples
-    
-    metrics['avg_html_length'] = total_length / n_samples
-    
-    return metrics
-
-
-class CustomSeq2SeqTrainer(Seq2SeqTrainer):
-    """Custom trainer that performs inference during evaluation"""
-    
-    def __init__(self, *args, **kwargs):
-        # Extract custom parameters
-        self.inference_samples = kwargs.pop('inference_samples', 3)
-        self.val_dataset_raw = kwargs.pop('val_dataset_raw', None)
-        self.processor = kwargs.pop('processor', None)
-        self.template = kwargs.pop('template', None)
-        self.logger = kwargs.pop('logger', None)
-        
-        # Select random samples for consistent evaluation
-        if self.val_dataset_raw:
-            self.eval_samples = random.sample(
-                list(self.val_dataset_raw), 
-                min(self.inference_samples, len(self.val_dataset_raw))
-            )
-        else:
-            self.eval_samples = []
-        
-        super().__init__(*args, **kwargs)
-    
-    def compute_metrics(self, eval_preds: EvalPrediction) -> Dict[str, Any]:
-        """Custom compute_metrics with inference and quality assessment"""
-        predictions, labels = eval_preds.predictions, eval_preds.label_ids
-        
-        # Replace -100 with pad_token_id for decoding
-        labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
-        predictions = np.where(predictions != -100, predictions, self.tokenizer.pad_token_id)
-        
-        # Decode predictions and labels
-        decoded_preds = self.tokenizer.batch_decode(predictions, skip_special_tokens=True)
-        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
-        
-        # Calculate text similarity metrics
-        similarity_metrics = calculate_text_similarity_metrics(decoded_preds, decoded_labels)
-        
-        # Calculate HTML quality metrics
-        html_metrics = calculate_html_quality_metrics(decoded_preds)
-        
-        # Combine metrics
-        metrics = {**similarity_metrics, **html_metrics}
-        
-        # Run inference on selected samples
-        if self.eval_samples and self.logger:
-            self.run_inference_evaluation()
-        
-        return metrics
-    
-    def run_inference_evaluation(self):
-        """Run inference on selected validation samples"""
-        self.logger.info(f"\n{'='*70}")
-        self.logger.info(f"INFERENCE EVALUATION - Step {self.state.global_step}")
-        self.logger.info(f"{'='*70}")
-        
-        # Set model to eval mode
-        self.model.eval()
-        
-        with torch.no_grad():
-            for i, sample in enumerate(self.eval_samples):
-                try:
-                    # Prepare input
-                    messages = sample['messages']
-                    user_message = messages[0]['content']
-                    expected_output = messages[1]['content']
-                    
-                    # Create input for generation
-                    gen_input = {
-                        'messages': [{'role': 'user', 'content': user_message}],
-                        'images': sample['images']
-                    }
-                    
-                    # Encode input
-                    inputs = self.template.encode(gen_input)
-                    
-                    # Move to device
-                    input_ids = torch.tensor(inputs['input_ids']).unsqueeze(0).to(self.model.device)
-                    attention_mask = torch.tensor(inputs['attention_mask']).unsqueeze(0).to(self.model.device)
-                    
-                    # Generate with mixed precision
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=512,
-                            do_sample=True,
-                            temperature=0.7,
-                            top_p=0.9,
-                            repetition_penalty=1.1,
-                            pad_token_id=self.processor.tokenizer.eos_token_id,
-                            eos_token_id=self.processor.tokenizer.eos_token_id
-                        )
-                    
-                    # Decode only the generated part (exclude input)
-                    generated_tokens = outputs[0][input_ids.shape[-1]:]
-                    generated_text = self.processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                    
-                    # Log comparison
-                    self.logger.info(f"\n--- Sample {i+1} ---")
-                    self.logger.info(f"Query: {user_message}")
-                    self.logger.info(f"Expected: {expected_output[:300]}{'...' if len(expected_output) > 300 else ''}")
-                    self.logger.info(f"Generated: {generated_text[:300]}{'...' if len(generated_text) > 300 else ''}")
-                    
-                    # Quality checks
-                    quality_checks = []
-                    gen_lower = generated_text.lower()
-                    
-                    if "<table" in gen_lower:
-                        quality_checks.append("✓ Contains <table>")
-                    else:
-                        quality_checks.append("✗ Missing <table>")
-                    
-                    if "</table>" in gen_lower:
-                        quality_checks.append("✓ Contains </table>")
-                    else:
-                        quality_checks.append("✗ Missing </table>")
-                    
-                    if "<tr" in gen_lower:
-                        quality_checks.append("✓ Contains <tr>")
-                    else:
-                        quality_checks.append("✗ Missing <tr>")
-                    
-                    if "<td" in gen_lower:
-                        quality_checks.append("✓ Contains <td>")
-                    else:
-                        quality_checks.append("✗ Missing <td>")
-                    
-                    self.logger.info(f"Quality: {', '.join(quality_checks)}")
-                    
-                    # Save sample output
-                    output_dir = os.path.join(self.args.output_dir, f"inference_step_{self.state.global_step}")
-                    os.makedirs(output_dir, exist_ok=True)
-                    
-                    output_file = os.path.join(output_dir, f"sample_{i+1}.html")
-                    with open(output_file, 'w', encoding='utf-8') as f:
-                        f.write(f"<!-- Step {self.state.global_step} - Sample {i+1} -->\n")
-                        f.write(f"<!-- Expected Output -->\n{expected_output}\n\n")
-                        f.write(f"<!-- Generated Output -->\n{generated_text}\n")
-                        
-                except Exception as e:
-                    self.logger.error(f"Error during inference on sample {i+1}: {e}")
-                    continue
-        
-        # Return model to training mode
-        self.model.train()
-        self.logger.info(f"{'='*70}\n")
 
 
 def main():
@@ -425,7 +285,7 @@ def main():
         eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
-        metric_for_best_model='rouge1_f1',  # Use ROUGE-1 F1 as best metric
+        metric_for_best_model='loss',
         save_total_limit=3,  # Reduced to save disk space
         logging_steps=10,  # Increased to reduce overhead
         dataloader_num_workers=dataloader_workers,  # Scale with GPU count
@@ -441,8 +301,6 @@ def main():
         dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
         ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
         save_safetensors=True,  # More efficient saving
-        load_best_model_at_end=True,  # Load best model at end
-        greater_is_better=True,  # Higher ROUGE score is better
     )
     
     # Load model with memory optimizations
@@ -481,7 +339,7 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply Swift format transformation
+    # Apply HTML truncation to reduce sequence length
     train_processed = raw_dataset['train'].map(create_swift_format_single)
     val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
@@ -505,25 +363,34 @@ def main():
         logger.error("No training samples remain after filtering! Consider increasing max_length or reducing HTML truncation.")
         return
     
+    # Create inference callback
+    # Scale number of inference samples based on validation dataset size
+    inference_samples = min(3, len(val_dataset))  # Don't exceed available samples
+    inference_callback = InferenceCallback(
+        eval_dataset=val_processed,  # Use original processed dataset, not LazyLLMDataset
+        template=template,
+        num_samples=inference_samples,
+        max_gen_length=512  # Conservative generation length
+    )
+    
+    logger.info(f"Inference callback configured with {inference_samples} validation samples")
+    
     # Clear memory before training
     clear_gpu_memory()
     
-    # Train with custom trainer
+    # Train
     model.enable_input_require_grads()
-    trainer = CustomSeq2SeqTrainer(
+    trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
         data_collator=template.data_collator,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
-        tokenizer=processor.tokenizer,
-        # Custom parameters for inference
-        inference_samples=3,
-        val_dataset_raw=val_processed,
-        processor=processor,
-        logger=logger,
     )
+    
+    # Add the inference callback
+    trainer.add_callback(inference_callback)
     
     try:
         # Monitor GPU memory during training
@@ -531,6 +398,7 @@ def main():
             for i in range(torch.cuda.device_count()):
                 logger.info(f"GPU {i} memory before training: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
         
+        logger.info("Starting training with inference validation callback...")
         trainer.train()
         
     except Exception as e:
@@ -544,7 +412,7 @@ def main():
     os.makedirs(visual_loss_dir, exist_ok=True)
     plot_images(visual_loss_dir, training_args.logging_dir, ['train/loss'], 0.9)
     
-    logger.info(f'Training complete. Model saved to: {trainer.state.best_model_checkpoint}')
+    logger.info(f'Training complete. Model saved to: {trainer.state.last_model_checkpoint}')
     
     # Final memory cleanup
     clear_gpu_memory()
