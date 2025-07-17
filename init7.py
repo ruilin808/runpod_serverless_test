@@ -324,8 +324,6 @@ def main():
         save_safetensors=True,
         # Additional DeepSpeed optimizations
         ddp_backend="nccl",
-        sharded_ddp="simple",  # Let DeepSpeed handle sharding
-        prediction_loss_only=True,
     )
     
     # Load model with ZeRO-3 optimizations
