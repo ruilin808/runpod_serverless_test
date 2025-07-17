@@ -270,7 +270,7 @@ def main():
         save_strategy='steps',
         save_steps=100,
         eval_strategy='steps',
-        eval_steps=100,
+        eval_steps=10,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='eval_teds_score',  # Use TEDS as best model metric
