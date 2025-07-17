@@ -8,6 +8,56 @@ import os
 import torch
 import gc
 
+# Setup cache directories
+def setup_cache_directories():
+    """Setup cache directory structure"""
+    workspace_dir = "/workspace"
+    cache_dir = os.path.join(workspace_dir, "cache")
+    
+    # Create cache directory structure
+    cache_dirs = {
+        'huggingface': os.path.join(cache_dir, "huggingface"),
+        'modelscope': os.path.join(cache_dir, "modelscope"),
+        'datasets': os.path.join(cache_dir, "datasets"),
+        'torch': os.path.join(cache_dir, "torch")
+    }
+    
+    # Create directories if they don't exist
+    for cache_type, path in cache_dirs.items():
+        os.makedirs(path, exist_ok=True)
+        print(f"Cache directory for {cache_type}: {path}")
+    
+    # Set environment variables for caching
+    os.environ['HF_HOME'] = cache_dirs['huggingface']
+    os.environ['TRANSFORMERS_CACHE'] = cache_dirs['huggingface']
+    os.environ['HF_DATASETS_CACHE'] = cache_dirs['datasets']
+    os.environ['TORCH_HOME'] = cache_dirs['torch']
+    
+    # ModelScope cache (if using ModelScope)
+    os.environ['MODELSCOPE_CACHE'] = cache_dirs['modelscope']
+    
+    # Create additional directories
+    models_dir = os.path.join(workspace_dir, "models")
+    datasets_dir = os.path.join(workspace_dir, "datasets")
+    output_dir = os.path.join(workspace_dir, "output")
+    
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(datasets_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"Models directory: {models_dir}")
+    print(f"Datasets directory: {datasets_dir}")
+    print(f"Output directory: {output_dir}")
+    
+    return {
+        'workspace': workspace_dir,
+        'cache': cache_dir,
+        'models': models_dir,
+        'datasets': datasets_dir,
+        'output': output_dir,
+        **cache_dirs
+    }
+
 # Auto-detect and use all available GPUs
 def setup_gpus():
     """Setup GPU configuration based on available devices"""
@@ -32,6 +82,9 @@ def setup_gpus():
     else:
         print("No CUDA GPUs available")
         return 0
+
+# Setup cache directories first
+directories = setup_cache_directories()
 
 # Setup GPUs before importing other modules
 gpu_count = setup_gpus()
@@ -135,7 +188,7 @@ def main():
     
     # Configuration - Scale parameters based on GPU count
     model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
-    output_dir = 'output'
+    output_dir = directories['output']  # Use the workspace output directory
     data_seed = 42
     
     # Scale max_length based on GPU count for better memory distribution
@@ -165,6 +218,13 @@ def main():
     per_device_batch_size, gradient_accumulation_steps = calculate_batch_size_and_accumulation(
         gpu_count, base_batch_size=1, target_effective_batch_size=32
     )
+    
+    logger.info(f"Directory Structure:")
+    logger.info(f"  - Workspace: {directories['workspace']}")
+    logger.info(f"  - Cache: {directories['cache']}")
+    logger.info(f"  - Models: {directories['models']}")
+    logger.info(f"  - Datasets: {directories['datasets']}")
+    logger.info(f"  - Output: {directories['output']}")
     
     logger.info(f"Multi-GPU Scaling Configuration:")
     logger.info(f"  - GPUs available: {gpu_count}")
@@ -215,11 +275,14 @@ def main():
     
     # Load model with memory optimizations
     logger.info("Loading model with memory optimizations...")
+    logger.info(f"Model will be cached in: {os.environ.get('TRANSFORMERS_CACHE', 'default location')}")
+    
     model, processor = get_model_tokenizer(
         model_id_or_path,
         torch_dtype=torch.float16,  # Use half precision
         device_map='auto',  # Let accelerate handle device placement
         low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+        cache_dir=directories['huggingface'],  # Explicit cache directory
     )
     
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
@@ -247,7 +310,12 @@ def main():
     
     # Load and process dataset
     logger.info("Loading dataset...")
-    raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
+    logger.info(f"Dataset will be cached in: {os.environ.get('HF_DATASETS_CACHE', 'default location')}")
+    
+    raw_dataset = hf_load_dataset(
+        "ruilin808/dataset_1920x1280",
+        cache_dir=directories['datasets']  # Explicit cache directory for datasets
+    )
     
     # Apply HTML truncation to reduce sequence length
     logger.info("Truncating HTML content...")
