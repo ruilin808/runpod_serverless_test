@@ -419,7 +419,7 @@ def main():
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
-        save_steps=100,  # Increased to reduce I/O
+        save_steps=2,  # Increased to reduce I/O
         eval_strategy='steps',
         eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
