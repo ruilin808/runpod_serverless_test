@@ -51,9 +51,10 @@ from datasets import load_dataset as hf_load_dataset
 class InferenceCallback(TrainerCallback):
     """Callback to run inference on validation samples during evaluation"""
     
-    def __init__(self, eval_dataset, template, num_samples=3, max_gen_length=512):
+    def __init__(self, eval_dataset, template, processor, num_samples=3, max_gen_length=512):
         self.eval_dataset = eval_dataset
         self.template = template
+        self.processor = processor  # Store processor/tokenizer
         self.num_samples = min(num_samples, len(eval_dataset)) if len(eval_dataset) > 0 else 0
         self.max_gen_length = max_gen_length
         
@@ -66,7 +67,7 @@ class InferenceCallback(TrainerCallback):
                 replace=False
             )
     
-    def on_evaluate(self, args, state, control, model, tokenizer, eval_dataloader, **kwargs):
+    def on_evaluate(self, args, state, control, model, **kwargs):
         """Called at the end of evaluation - runs inference on validation samples"""
         
         # Only run on main process to avoid duplicated output
@@ -110,13 +111,13 @@ class InferenceCallback(TrainerCallback):
                             max_length=min(self.max_gen_length, len(inputs['input_ids']) + 256),
                             do_sample=False,  # Deterministic
                             num_beams=1,      # Faster than beam search
-                            pad_token_id=tokenizer.pad_token_id,
-                            eos_token_id=tokenizer.eos_token_id,
+                            pad_token_id=self.processor.tokenizer.pad_token_id,
+                            eos_token_id=self.processor.tokenizer.eos_token_id,
                         )
                         
                         # Decode prediction (remove input tokens)
                         generated_tokens = outputs[0][len(input_ids[0]):]
-                        predicted_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                        predicted_text = self.processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
                         
                         # Get ground truth
                         ground_truth = sample['messages'][1]['content']
@@ -282,7 +283,7 @@ def main():
         save_strategy='steps',
         save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=2,  # Increased to reduce I/O
+        eval_steps=100,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
@@ -369,6 +370,7 @@ def main():
     inference_callback = InferenceCallback(
         eval_dataset=val_processed,  # Use original processed dataset, not LazyLLMDataset
         template=template,
+        processor=processor,  # Pass processor instead of relying on tokenizer parameter
         num_samples=inference_samples,
         max_gen_length=512  # Conservative generation length
     )
