@@ -118,7 +118,7 @@ def main():
     clear_gpu_memory()
     
     # Configuration - Scale parameters based on GPU count
-    model_id_or_path = 'Qwen/Qwen2-VL-2B-Instruct'
+    model_id_or_path = 'Qwen/Qwen2.5-VL-32B-Instruct'
     output_dir = 'output'
     data_seed = 42
     
