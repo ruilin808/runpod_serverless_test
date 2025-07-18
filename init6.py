@@ -67,8 +67,9 @@ def filter_by_length(dataset, template, max_length):
     """Filter out samples that exceed max_length after encoding"""
     def is_valid_length(sample):
         try:
-            encoded = template.encode(sample)
-            return len(encoded['input_ids']) <= max_length
+            # encoded = template.encode(sample)
+            # return len(encoded['input_ids']) <= max_length
+            return len(sample['html_table']) <= 50000
         except Exception:
             return False
     
