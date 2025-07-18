@@ -164,35 +164,36 @@ def main():
     # Training arguments - Memory optimized
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
-        learning_rate=1e-4,
+        learning_rate=5e-5,
         per_device_train_batch_size=per_device_batch_size,
         per_device_eval_batch_size=per_device_batch_size,
         gradient_checkpointing=True,
         weight_decay=0.1,
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.05,
+        lr_scheduler_type='linear',
+        warmup_ratio=0.1,
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
         save_steps=100,  # Increased to reduce I/O
         eval_strategy='steps',
-        eval_steps=100,  # Increased to reduce I/O
+        eval_steps=50,  # Increased to reduce I/O
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
         save_total_limit=3,  # Reduced to save disk space
-        logging_steps=10,  # Increased to reduce overhead
+        logging_steps=2,  # Increased to reduce overhead
         dataloader_num_workers=dataloader_workers,  # Scale with GPU count
         data_seed=data_seed,
         remove_unused_columns=False,
-        max_grad_norm=1.0,
+        max_grad_norm=1,
         # Memory optimization settings
         dataloader_pin_memory=False,  # Disable to save memory
+        dataloader_drop_last=True,   # Ensure consistent batch sizes
         ddp_find_unused_parameters=False,
         ddp_timeout=1800,
         # Additional memory optimizations
-        fp16=False,  # Enable mixed precision training
-        bf16=True,  # Use bfloat16 if available
+        fp16=True,  # Enable mixed precision training
+        bf16=False,  # Use bfloat16 if available
         dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
         ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
         save_safetensors=True,  # More efficient saving
@@ -202,9 +203,10 @@ def main():
     logger.info("Loading model with memory optimizations...")
     model, processor = get_model_tokenizer(
         model_id_or_path,
-        torch_dtype=torch.float16,  # Use half precision
+        torch_dtype=torch.bfloat16,  # Use half precision
         device_map='auto',  # Let accelerate handle device placement
         low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
+        trust_remote_code=True,      # Add this
     )
     
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
