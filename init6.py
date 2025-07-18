@@ -220,18 +220,11 @@ def main():
         adam_epsilon=1e-8,
     )
 
-    # Additional debugging - add this before trainer.train()
+    # Additional debugging - MOVE THIS AFTER MODEL LOADING
     print(f"Learning rate: {training_args.learning_rate}")
     print(f"Optimizer: {training_args.optim}")
     print(f"Warmup steps: {training_args.warmup_steps}")
     print(f"LR scheduler: {training_args.lr_scheduler_type}")
-
-    # Check if model parameters require gradients
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"Percentage trainable: {100 * trainable_params / total_params:.2f}%")
     
     # Load model with memory optimizations
     logger.info("Loading model with memory optimizations...")
@@ -262,6 +255,13 @@ def main():
     model_parameter_info = get_model_parameter_info(model)
     logger.info(f'model_parameter_info: {model_parameter_info}')
     
+    # NOW CHECK MODEL PARAMETERS (AFTER MODEL IS LOADED)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Percentage trainable: {100 * trainable_params / total_params:.2f}%")
+    
     # Clear memory after model loading
     clear_gpu_memory()
     
@@ -269,19 +269,15 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # Apply HTML truncation to reduce sequence length
-    # logger.info("Truncating HTML content...")
-    # train_processed = raw_dataset['train'].map(truncate_html_content)
-    # val_processed = raw_dataset['validation'].map(truncate_html_content)
-    
-    # Convert to Swift format
-    train_processed = train_processed.map(create_swift_format_single)
-    val_processed = val_processed.map(create_swift_format_single)
+    # FIX: Convert raw dataset to Swift format DIRECTLY (no truncation)
+    logger.info("Converting to Swift format...")
+    train_processed = raw_dataset['train'].map(create_swift_format_single)
+    val_processed = raw_dataset['validation'].map(create_swift_format_single)
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
-    # Filter out samples that are too long
-    logger.info("Filtering samples by length...")
+    # Filter out samples that are too long (using character count, not encoding)
+    logger.info("Filtering samples by HTML character length...")
     train_processed = filter_by_length(train_processed, template, max_length)
     val_processed = filter_by_length(val_processed, template, max_length)
     
@@ -295,7 +291,7 @@ def main():
     
     # Check if we have enough data after filtering
     if len(train_dataset) == 0:
-        logger.error("No training samples remain after filtering! Consider increasing max_length or reducing HTML truncation.")
+        logger.error("No training samples remain after filtering! Consider increasing max_length.")
         return
     
     # Clear memory before training
