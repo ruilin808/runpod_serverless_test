@@ -67,13 +67,28 @@ def filter_by_length(dataset, template, max_length):
     """Filter out samples that exceed max_length after encoding"""
     def is_valid_length(sample):
         try:
-            # encoded = template.encode(sample)
-            # return len(encoded['input_ids']) <= max_length
-            return len(sample['html_table']) <= 50000
+            #encoded = template.encode(sample)
+            return len(sample['html_table']) <= max_length # len(encoded['input_ids']) <= max_length
         except Exception:
             return False
     
     return dataset.filter(is_valid_length)
+
+
+def truncate_html_content(sample, max_html_chars=None):
+    """Truncate HTML content based on available GPU memory"""
+    if max_html_chars is None:
+        # Scale HTML length based on GPU count and available memory
+        if gpu_count >= 8:
+            max_html_chars = 8000  # More GPUs = can handle longer sequences
+        elif gpu_count >= 4:
+            max_html_chars = 6000
+        else:
+            max_html_chars = 4000
+    
+    if len(sample['html_table']) > max_html_chars:
+        sample['html_table'] = sample['html_table'][:max_html_chars] + "..."
+    return sample
 
 
 def calculate_batch_size_and_accumulation(gpu_count, base_batch_size=1, target_effective_batch_size=32):
@@ -165,49 +180,66 @@ def main():
     # Training arguments - Memory optimized
     training_args = Seq2SeqTrainingArguments(
         output_dir=output_dir,
-        learning_rate=5e-5,
+        learning_rate=1e-4,  # This should NOT be 0!
         per_device_train_batch_size=per_device_batch_size,
         per_device_eval_batch_size=per_device_batch_size,
         gradient_checkpointing=True,
         weight_decay=0.1,
-        lr_scheduler_type='linear',
-        warmup_ratio=0.1,
+        lr_scheduler_type='cosine',
+        warmup_ratio=0.05,
+        warmup_steps=10,  # Add explicit warmup steps
         report_to=['tensorboard'],
         logging_first_step=True,
         save_strategy='steps',
-        save_steps=100,  # Increased to reduce I/O
+        save_steps=100,
         eval_strategy='steps',
-        eval_steps=50,  # Increased to reduce I/O
+        eval_steps=100,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=3,
         metric_for_best_model='loss',
-        save_total_limit=3,  # Reduced to save disk space
-        logging_steps=2,  # Increased to reduce overhead
-        dataloader_num_workers=dataloader_workers,  # Scale with GPU count
+        save_total_limit=3,
+        logging_steps=10,
+        dataloader_num_workers=dataloader_workers,
         data_seed=data_seed,
         remove_unused_columns=False,
-        max_grad_norm=1,
+        max_grad_norm=1.0,
         # Memory optimization settings
-        dataloader_pin_memory=False,  # Disable to save memory
-        dataloader_drop_last=True,   # Ensure consistent batch sizes
+        dataloader_pin_memory=False,
         ddp_find_unused_parameters=False,
         ddp_timeout=1800,
-        # Additional memory optimizations
-        fp16=True,  # Enable mixed precision training
-        bf16=False,  # Use bfloat16 if available
-        dataloader_prefetch_factor=2,  # Reduce prefetch to save memory
-        ddp_bucket_cap_mb=25,  # Reduce DDP bucket size
-        save_safetensors=True,  # More efficient saving
+        # Mixed precision training
+        fp16=True,
+        dataloader_prefetch_factor=2,
+        ddp_bucket_cap_mb=25,
+        save_safetensors=True,
+        # CRITICAL FIXES:
+        lr_scheduler_kwargs={},  # Ensure scheduler works properly
+        optim="adamw_torch",     # Explicit optimizer
+        adam_beta1=0.9,          # Explicit optimizer parameters
+        adam_beta2=0.999,
+        adam_epsilon=1e-8,
     )
+
+    # Additional debugging - add this before trainer.train()
+    print(f"Learning rate: {training_args.learning_rate}")
+    print(f"Optimizer: {training_args.optim}")
+    print(f"Warmup steps: {training_args.warmup_steps}")
+    print(f"LR scheduler: {training_args.lr_scheduler_type}")
+
+    # Check if model parameters require gradients
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Percentage trainable: {100 * trainable_params / total_params:.2f}%")
     
     # Load model with memory optimizations
     logger.info("Loading model with memory optimizations...")
     model, processor = get_model_tokenizer(
         model_id_or_path,
-        torch_dtype=torch.bfloat16,  # Use half precision
+        torch_dtype=torch.float16,  # Use half precision
         device_map='auto',  # Let accelerate handle device placement
         low_cpu_mem_usage=True,  # Reduce CPU memory usage during loading
-        trust_remote_code=True,      # Add this
     )
     
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
@@ -237,13 +269,14 @@ def main():
     logger.info("Loading dataset...")
     raw_dataset = hf_load_dataset("ruilin808/dataset_1920x1280")
     
-    # no HTML truncation to reduce sequence length
-    train_processed = raw_dataset['train'].map(create_swift_format_single)
-    val_processed = raw_dataset['validation'].map(create_swift_format_single)
+    # Apply HTML truncation to reduce sequence length
+    # logger.info("Truncating HTML content...")
+    # train_processed = raw_dataset['train'].map(truncate_html_content)
+    # val_processed = raw_dataset['validation'].map(truncate_html_content)
     
     # Convert to Swift format
-    #train_processed = train_processed.map(create_swift_format_single)
-    #val_processed = val_processed.map(create_swift_format_single)
+    train_processed = train_processed.map(create_swift_format_single)
+    val_processed = val_processed.map(create_swift_format_single)
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
