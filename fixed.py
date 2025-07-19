@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Memory-Optimized Qwen2-VL Fine-tuning Script with Token Clamping Fix
-FIXES OUT-OF-VOCABULARY TOKEN ISSUE
+Image Token-Aware Token Clamping Fix for Qwen2-VL
+Preserves special tokens while fixing out-of-vocabulary issues
 """
 
 import os
@@ -63,31 +63,69 @@ def create_swift_format_single(sample):
     }
 
 
-def clamp_tokens_to_vocab(token_ids, vocab_size, replacement_token=None):
-    """Clamp out-of-vocabulary tokens to valid range"""
+def get_special_token_ranges(tokenizer):
+    """Identify ranges of special tokens that should NOT be clamped"""
+    special_tokens = set()
+    vocab_size = tokenizer.vocab_size
+    
+    # Add known special tokens
+    for attr in ['pad_token_id', 'eos_token_id', 'bos_token_id', 'unk_token_id']:
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is not None:
+            special_tokens.add(token_id)
+    
+    # For Qwen2-VL, image tokens are typically in a specific range beyond vocab_size
+    # Based on your logs, tokens 151655 appear, which suggests image tokens start around 151643
+    # Let's preserve tokens in the range [151643, 151700] as potential image tokens
+    image_token_start = vocab_size  # 151643
+    image_token_end = vocab_size + 100  # Give some buffer
+    
+    print(f"Preserving special tokens: {special_tokens}")
+    print(f"Preserving image token range: [{image_token_start}, {image_token_end})")
+    
+    return special_tokens, (image_token_start, image_token_end)
+
+
+def smart_clamp_tokens(token_ids, vocab_size, special_tokens, image_token_range, replacement_token=0):
+    """Intelligently clamp tokens while preserving special tokens"""
     if isinstance(token_ids, list):
         token_ids = torch.tensor(token_ids)
     
-    # Find out-of-vocab tokens
+    # Find tokens that are out of regular vocabulary but NOT special tokens
     invalid_mask = token_ids >= vocab_size
     
     if invalid_mask.any():
-        if replacement_token is None:
-            # Use the unknown token ID (typically 0 or 1)
-            replacement_token = 0
+        # Don't clamp special tokens or image tokens
+        image_start, image_end = image_token_range
         
-        # Replace invalid tokens
-        token_ids = token_ids.clone()
-        token_ids[invalid_mask] = replacement_token
+        # Create mask for tokens that should be preserved
+        preserve_mask = torch.zeros_like(invalid_mask, dtype=torch.bool)
         
-        invalid_count = invalid_mask.sum().item()
-        print(f"Clamped {invalid_count} out-of-vocab tokens to {replacement_token}")
+        for special_token in special_tokens:
+            preserve_mask |= (token_ids == special_token)
+            
+        # Preserve image tokens in the expected range
+        preserve_mask |= ((token_ids >= image_start) & (token_ids < image_end))
+        
+        # Only clamp tokens that are invalid AND not preserved
+        clamp_mask = invalid_mask & (~preserve_mask)
+        
+        if clamp_mask.any():
+            token_ids = token_ids.clone()
+            token_ids[clamp_mask] = replacement_token
+            
+            clamped_count = clamp_mask.sum().item()
+            preserved_count = (invalid_mask & preserve_mask).sum().item()
+            print(f"Clamped {clamped_count} out-of-vocab tokens, preserved {preserved_count} special tokens")
+        else:
+            preserved_count = invalid_mask.sum().item()
+            print(f"Preserved {preserved_count} special/image tokens")
     
     return token_ids
 
 
-def encode_sample_with_clamping(template, sample, tokenizer):
-    """Encode sample and clamp any out-of-vocabulary tokens"""
+def encode_sample_with_smart_clamping(template, sample, tokenizer, special_tokens, image_token_range):
+    """Encode sample with intelligent token clamping"""
     try:
         # Get the raw encoding first
         encoded = template.encode(sample)
@@ -103,16 +141,22 @@ def encode_sample_with_clamping(template, sample, tokenizer):
         if isinstance(labels, list):
             labels = torch.tensor(labels)
             
-        # Clamp input_ids to valid vocabulary range
-        input_ids = clamp_tokens_to_vocab(input_ids, vocab_size, replacement_token=tokenizer.unk_token_id or 0)
+        # Smart clamp input_ids
+        input_ids = smart_clamp_tokens(
+            input_ids, vocab_size, special_tokens, image_token_range, 
+            replacement_token=tokenizer.unk_token_id or 0
+        )
         
-        # Clamp labels to valid vocabulary range (but preserve -100 ignore tokens)
+        # Smart clamp labels (but preserve -100 ignore tokens)
         if labels is not None:
             # Only clamp non-ignore tokens
             non_ignore_mask = labels != -100
             if non_ignore_mask.any():
                 valid_labels = labels[non_ignore_mask]
-                clamped_labels = clamp_tokens_to_vocab(valid_labels, vocab_size, replacement_token=tokenizer.unk_token_id or 0)
+                clamped_labels = smart_clamp_tokens(
+                    valid_labels, vocab_size, special_tokens, image_token_range,
+                    replacement_token=tokenizer.unk_token_id or 0
+                )
                 labels = labels.clone()
                 labels[non_ignore_mask] = clamped_labels
         
@@ -127,7 +171,7 @@ def encode_sample_with_clamping(template, sample, tokenizer):
         return None, f"Encoding failed: {str(e)}"
 
 
-def filter_by_length(dataset, template, tokenizer, max_length):
+def filter_by_length(dataset, template, tokenizer, special_tokens, image_token_range, max_length):
     """Filter out samples that exceed max_length after encoding"""
     valid_samples = []
     invalid_count = 0
@@ -135,8 +179,10 @@ def filter_by_length(dataset, template, tokenizer, max_length):
     print(f"Processing {len(dataset)} samples...")
     
     for i, sample in enumerate(dataset):
-        # Try to encode with clamping
-        encoded, error = encode_sample_with_clamping(template, sample, tokenizer)
+        # Try to encode with smart clamping
+        encoded, error = encode_sample_with_smart_clamping(
+            template, sample, tokenizer, special_tokens, image_token_range
+        )
         
         if encoded is None:
             invalid_count += 1
@@ -162,19 +208,21 @@ def filter_by_length(dataset, template, tokenizer, max_length):
     return Dataset.from_list(valid_samples)
 
 
-class TokenClampingDataCollator:
-    """Data collator that clamps out-of-vocabulary tokens"""
+class SmartTokenClampingDataCollator:
+    """Data collator that intelligently clamps out-of-vocabulary tokens"""
     
-    def __init__(self, base_collator, vocab_size, replacement_token=0):
+    def __init__(self, base_collator, vocab_size, special_tokens, image_token_range, replacement_token=0):
         self.base_collator = base_collator
         self.vocab_size = vocab_size
+        self.special_tokens = special_tokens
+        self.image_token_range = image_token_range
         self.replacement_token = replacement_token
     
     def __call__(self, features):
         # First apply the base collator
         batch = self.base_collator(features)
         
-        # Then clamp any out-of-vocab tokens
+        # Then intelligently clamp any out-of-vocab tokens
         for key in ['input_ids', 'labels']:
             if key in batch:
                 value = batch[key]
@@ -183,27 +231,27 @@ class TokenClampingDataCollator:
                 if isinstance(value, list):
                     value = torch.tensor(value)
                     
-                # Clamp out-of-vocab tokens
+                # Smart clamp out-of-vocab tokens
                 if key == 'labels':
                     # For labels, only clamp non-ignore tokens
                     non_ignore_mask = value != -100
                     if non_ignore_mask.any():
                         clamped_value = value.clone()
                         valid_tokens = value[non_ignore_mask]
-                        invalid_mask = valid_tokens >= self.vocab_size
-                        if invalid_mask.any():
-                            valid_tokens[invalid_mask] = self.replacement_token
-                            clamped_value[non_ignore_mask] = valid_tokens
+                        clamped_tokens = smart_clamp_tokens(
+                            valid_tokens, self.vocab_size, self.special_tokens, 
+                            self.image_token_range, self.replacement_token
+                        )
+                        clamped_value[non_ignore_mask] = clamped_tokens
                         batch[key] = clamped_value
                     else:
                         batch[key] = value
                 else:
-                    # For input_ids, clamp all out-of-vocab tokens
-                    invalid_mask = value >= self.vocab_size
-                    if invalid_mask.any():
-                        value = value.clone()
-                        value[invalid_mask] = self.replacement_token
-                    batch[key] = value
+                    # For input_ids, clamp all invalid tokens
+                    batch[key] = smart_clamp_tokens(
+                        value, self.vocab_size, self.special_tokens, 
+                        self.image_token_range, self.replacement_token
+                    )
         
         return batch
 
@@ -351,6 +399,9 @@ def main():
     print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
     print(f"UNK token: {tokenizer.unk_token}, ID: {tokenizer.unk_token_id}")
     
+    # Get special token information
+    special_tokens, image_token_range = get_special_token_ranges(tokenizer)
+    
     template = get_template(model.model_meta.template, processor, default_system=None, max_length=max_length)
     template.set_mode('train')
     template.model = model
@@ -392,10 +443,10 @@ def main():
     
     logger.info(f"Original dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
-    # Filter with token clamping
-    logger.info("Filtering samples with token clamping...")
-    train_processed = filter_by_length(train_processed, template, tokenizer, max_length)
-    val_processed = filter_by_length(val_processed, template, tokenizer, max_length)
+    # Filter with smart token clamping
+    logger.info("Filtering samples with smart token clamping...")
+    train_processed = filter_by_length(train_processed, template, tokenizer, special_tokens, image_token_range, max_length)
+    val_processed = filter_by_length(val_processed, template, tokenizer, special_tokens, image_token_range, max_length)
     
     logger.info(f"Filtered dataset sizes - Train: {len(train_processed)}, Val: {len(val_processed)}")
     
@@ -404,27 +455,31 @@ def main():
         logger.error("No training samples remain after filtering!")
         return
     
-    # Create custom encoding function that clamps tokens
-    def encode_with_clamping(sample):
-        encoded, error = encode_sample_with_clamping(template, sample, tokenizer)
+    # Create custom encoding function that clamps tokens smartly
+    def encode_with_smart_clamping(sample):
+        encoded, error = encode_sample_with_smart_clamping(
+            template, sample, tokenizer, special_tokens, image_token_range
+        )
         if encoded is None:
             raise ValueError(f"Failed to encode sample: {error}")
         return encoded
     
-    # Convert to LazyLLMDataset with clamping
-    train_dataset = LazyLLMDataset(train_processed, encode_with_clamping, random_state=data_seed)
-    val_dataset = LazyLLMDataset(val_processed, encode_with_clamping, random_state=data_seed)
+    # Convert to LazyLLMDataset with smart clamping
+    train_dataset = LazyLLMDataset(train_processed, encode_with_smart_clamping, random_state=data_seed)
+    val_dataset = LazyLLMDataset(val_processed, encode_with_smart_clamping, random_state=data_seed)
     
     logger.info(f"Final dataset sizes - Training: {len(train_dataset)}, Validation: {len(val_dataset)} samples")
     
     # Clear memory before training
     clear_gpu_memory()
     
-    # Create token-clamping data collator
+    # Create smart token-clamping data collator
     base_collator = template.data_collator
-    clamping_collator = TokenClampingDataCollator(
+    clamping_collator = SmartTokenClampingDataCollator(
         base_collator, 
         tokenizer.vocab_size, 
+        special_tokens,
+        image_token_range,
         replacement_token=tokenizer.unk_token_id or 0
     )
     
@@ -433,7 +488,7 @@ def main():
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
-        data_collator=clamping_collator,  # Use clamping collator
+        data_collator=clamping_collator,  # Use smart clamping collator
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         template=template,
@@ -458,11 +513,19 @@ def main():
                     valid_mask = tensor != -100
                     if valid_mask.any():
                         valid_tokens = tensor[valid_mask]
-                        if valid_tokens.max() >= tokenizer.vocab_size:
-                            raise ValueError(f"Invalid {key} found in batch: max={valid_tokens.max()}, vocab_size={tokenizer.vocab_size}")
+                        max_val = valid_tokens.max().item()
+                        if max_val >= tokenizer.vocab_size:
+                            # Check if it's in the preserved image token range
+                            image_start, image_end = image_token_range
+                            if max_val < image_start or max_val >= image_end:
+                                raise ValueError(f"Invalid {key} found in batch: max={max_val}, not in preserved range [{image_start}, {image_end})")
                 else:
-                    if tensor.max() >= tokenizer.vocab_size:
-                        raise ValueError(f"Invalid {key} found in batch: max={tensor.max()}, vocab_size={tokenizer.vocab_size}")
+                    max_val = tensor.max().item()
+                    if max_val >= tokenizer.vocab_size:
+                        # Check if it's in the preserved image token range
+                        image_start, image_end = image_token_range
+                        if max_val < image_start or max_val >= image_end:
+                            raise ValueError(f"Invalid {key} found in batch: max={max_val}, not in preserved range [{image_start}, {image_end})")
         
         # Test forward pass
         first_batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v 
