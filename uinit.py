@@ -11,7 +11,7 @@
 
 """### Unsloth"""
 
-from uinit import FastVisionModel # FastLanguageModel for LLMs
+from unsloth import FastVisionModel # FastLanguageModel for LLMs
 import torch
 
 model, tokenizer = FastVisionModel.from_pretrained(
