@@ -237,16 +237,19 @@ We use our new `UnslothVisionDataCollator` which will help in our vision finetun
 
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
+import wandb
 
 # Custom callback for validation evaluation
-class TableRecognitionCallback:
+from transformers import TrainerCallback
+
+class TableRecognitionCallback(TrainerCallback):
     def __init__(self, model, tokenizer, val_dataset, eval_steps=10):
         self.model = model
         self.tokenizer = tokenizer
         self.val_dataset = val_dataset
         self.eval_steps = eval_steps
         
-    def on_evaluate(self, args, state, control, model=None, **kwargs):
+    def on_log(self, args, state, control, model=None, **kwargs):
         if state.global_step % self.eval_steps == 0 and state.global_step > 0:
             print(f"\nRunning table recognition evaluation at step {state.global_step}...")
             
@@ -261,14 +264,7 @@ class TableRecognitionCallback:
             # Log metrics
             print(f"TEDS Structure Only: {metrics['teds_structure_only']:.4f}")
             print(f"TEDS Full: {metrics['teds_full']:.4f}")
-            
-            # Log to tensorboard/wandb if available
-            if hasattr(state, 'log_history'):
-                state.log_history.append({
-                    "step": state.global_step,
-                    "eval_teds_structure_only": metrics['teds_structure_only'],
-                    "eval_teds_full": metrics['teds_full']
-                })
+            print()  # Add spacing
 
 FastVisionModel.for_training(model) # Enable for training!
 
@@ -294,12 +290,6 @@ trainer = SFTTrainer(
         seed = 3407,
         output_dir = "outputs",
         report_to = "tensorboard", #none    # For Weights and Biases
-        
-        # Evaluation settings
-        eval_steps = 10,  # Evaluate every 10 steps
-        evaluation_strategy = "steps",
-        save_steps = 10,
-        save_strategy = "steps",
 
         # You MUST put the below items for vision finetuning:
         remove_unused_columns = False,
