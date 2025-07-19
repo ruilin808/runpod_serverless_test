@@ -11,7 +11,7 @@
 
 """### Unsloth"""
 
-from unsloth import FastVisionModel # FastLanguageModel for LLMs
+from unsloth1 import FastVisionModel # FastLanguageModel for LLMs
 import torch
 
 model, tokenizer = FastVisionModel.from_pretrained(
@@ -122,7 +122,7 @@ inputs = tokenizer(
 
 from transformers import TextStreamer
 text_streamer = TextStreamer(tokenizer, skip_prompt = True)
-_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 128,
+_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 8000,
                    use_cache = True, temperature = 1.5, min_p = 0.1)
 
 """<a name="Train"></a>
@@ -198,7 +198,7 @@ We use `min_p = 0.1` and `temperature = 1.5`. Read this [Tweet](https://x.com/me
 FastVisionModel.for_inference(model) # Enable for inference!
 
 image = dataset[2]["image"]
-instruction = "Write the LaTeX representation for this image."
+instruction = "Write the html representation for this image."
 
 messages = [
     {"role": "user", "content": [
@@ -216,7 +216,7 @@ inputs = tokenizer(
 
 from transformers import TextStreamer
 text_streamer = TextStreamer(tokenizer, skip_prompt = True)
-_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 128,
+_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 8000,
                    use_cache = True, temperature = 1.5, min_p = 0.1)
 
 """<a name="Save"></a>
@@ -242,7 +242,7 @@ if False:
     FastVisionModel.for_inference(model) # Enable for inference!
 
 image = dataset[0]["image"]
-instruction = "Write the LaTeX representation for this image."
+instruction = "Write the html representation for this image."
 
 messages = [
     {"role": "user", "content": [
@@ -260,7 +260,7 @@ inputs = tokenizer(
 
 from transformers import TextStreamer
 text_streamer = TextStreamer(tokenizer, skip_prompt = True)
-_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 128,
+_ = model.generate(**inputs, streamer = text_streamer, max_new_tokens = 8000,
                    use_cache = True, temperature = 1.5, min_p = 0.1)
 
 """### Saving to float16 for VLLM
