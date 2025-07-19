@@ -237,7 +237,6 @@ We use our new `UnslothVisionDataCollator` which will help in our vision finetun
 
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
-import wandb
 
 # Custom callback for validation evaluation
 from transformers import TrainerCallback
