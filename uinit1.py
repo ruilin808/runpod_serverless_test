@@ -202,8 +202,8 @@ def evaluate_table_recognition(model, tokenizer, val_dataset, num_samples=50):
         
         # Calculate TEDS scores
         try:
-            teds_structure_score = teds_structure_only.evaluate(gt_html, pred_text)
-            teds_full_score = teds_full.evaluate(gt_html, pred_text)
+            teds_structure_score = teds_structure_only(gt_html, pred_text)
+            teds_full_score = teds_full(gt_html, pred_text)
             
             teds_structure_scores.append(teds_structure_score)
             teds_full_scores.append(teds_full_score)
@@ -237,6 +237,7 @@ We use our new `UnslothVisionDataCollator` which will help in our vision finetun
 
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
+import wandb
 
 # Custom callback for validation evaluation
 from transformers import TrainerCallback
