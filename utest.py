@@ -306,6 +306,7 @@ trainer = SFTTrainer(
     tokenizer=tokenizer,
     data_collator=UnslothVisionDataCollator(model, tokenizer),  # Must use!
     train_dataset=converted_train_dataset,
+    eval_dataset=converted_val_dataset, 
     args=SFTConfig(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
