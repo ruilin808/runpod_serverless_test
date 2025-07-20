@@ -326,7 +326,7 @@ trainer = SFTTrainer(
         dataset_kwargs={"skip_prepare_dataset": True},
         max_seq_length=2048,
         save_strategy="epoch",         # Save more frequently
-        evaluation_strategy="epoch",   # Evaluate each epoch
+        eval_strategy="epoch",   # Evaluate each epoch
     ),
 )
 
