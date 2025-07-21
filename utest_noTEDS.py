@@ -307,30 +307,7 @@ trainer = SFTTrainer(
     data_collator=UnslothVisionDataCollator(model, tokenizer),  # Must use!
     train_dataset=converted_train_dataset,
     eval_dataset=converted_val_dataset, 
-    '''
-    args=SFTConfig(
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=8,
-        warmup_steps=10,
-        max_steps=30,
-        num_train_epochs=5,  # Set this instead of max_steps for full training runs
-        learning_rate=1e-4,
-        logging_steps=1,
-        optim="adamw_8bit",
-        weight_decay=0.1,
-        lr_scheduler_type="cosine",
-        seed=3407,
-        output_dir="outputs",
-        report_to="tensorboard",  # none    # For Weights and Biases
-        # You MUST put the below items for vision finetuning:
-        remove_unused_columns=False,
-        dataset_text_field="",
-        dataset_kwargs={"skip_prepare_dataset": True},
-        max_seq_length=2048,
-        save_strategy="epoch",         # Save more frequently
-        eval_strategy="epoch",   # Evaluate each epoch
-    ),
-    '''
+
     args=SFTConfig(
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
