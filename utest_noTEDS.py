@@ -307,6 +307,7 @@ trainer = SFTTrainer(
     data_collator=UnslothVisionDataCollator(model, tokenizer),  # Must use!
     train_dataset=converted_train_dataset,
     eval_dataset=converted_val_dataset, 
+    '''
     args=SFTConfig(
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
@@ -329,6 +330,28 @@ trainer = SFTTrainer(
         save_strategy="epoch",         # Save more frequently
         eval_strategy="epoch",   # Evaluate each epoch
     ),
+    '''
+    args=SFTConfig(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=20,
+        # max_steps=200,  # Alternative to epochs
+        num_train_epochs=3,
+        learning_rate=5e-5,              # Reduced
+        logging_steps=5,                 # Log more frequently
+        optim="adamw_8bit",
+        weight_decay=0.01,               # Reduced
+        lr_scheduler_type="cosine",
+        seed=3407,
+        output_dir="outputs",
+        report_to="tensorboard",
+        remove_unused_columns=False,
+        dataset_text_field="",
+        dataset_kwargs={"skip_prepare_dataset": True},
+        max_seq_length=2048,
+        save_strategy="epoch",
+        eval_strategy="epoch",
+)   ,
 )
 
 # Add custom callback
