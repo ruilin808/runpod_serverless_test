@@ -351,7 +351,7 @@ trainer = SFTTrainer(
         max_seq_length=2048,
         save_strategy="epoch",
         eval_strategy="epoch",
-)   ,
+    ),
 )
 
 # Add custom callback
