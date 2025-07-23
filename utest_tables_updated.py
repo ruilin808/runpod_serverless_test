@@ -39,9 +39,9 @@ model = FastVisionModel.get_peft_model(
     finetune_language_layers=True,  # False if not finetuning language layers
     finetune_attention_modules=True,  # False if not finetuning attention layers
     finetune_mlp_modules=True,      # False if not finetuning MLP layers
-    r=8,                          # The larger, the higher the accuracy, but might overfit
+    r=4,                          # The larger, the higher the accuracy, but might overfit
     lora_alpha=8,                 # Recommended alpha == r at least
-    lora_dropout=0,
+    lora_dropout=0.1,
     bias="none",
     random_state=3407,
     use_rslora=False,              # We support rank stabilized LoRA
@@ -50,7 +50,7 @@ model = FastVisionModel.get_peft_model(
 )
 
 """
-### Data Preparation
+### Data Preparation with HTML Filtering
 We'll be using a sampled dataset of handwritten maths formulas. The goal is to convert these images into a computer readable form - 
 ie in LaTeX form, so we can render it. This can be very useful for complex formulas.
 
@@ -63,6 +63,110 @@ from datasets import load_dataset
 # Load datasets
 train_dataset = load_dataset("ruilin808/dataset_1920x1280", split="train")
 val_dataset = load_dataset("ruilin808/dataset_1920x1280", split="validation")
+
+def clean_html_content(html_content):
+    """
+    Clean HTML content by removing unwanted wrapper tags and code blocks.
+    
+    Args:
+        html_content (str): Raw HTML content to clean
+        
+    Returns:
+        str: Cleaned HTML content
+    """
+    if not html_content:
+        return html_content
+    
+    # Strip surrounding ```html ... ``` or <html>...</html> blocks if present
+    cleaned_html = html_content.strip()
+    cleaned_html = re.sub(r'^```(?:html)?\s*', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'\s*```$', '', cleaned_html)
+    cleaned_html = re.sub(r'^<html>\s*', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'\s*</html>$', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'^<body>\s*', '', cleaned_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r'\s*</body>$', '', cleaned_html, flags=re.IGNORECASE)
+    
+    return cleaned_html.strip()
+
+def is_valid_html_sample(sample):
+    """
+    Validate HTML sample for training quality.
+    
+    Args:
+        sample: Dataset sample containing 'html_table' and 'image'
+        
+    Returns:
+        bool: True if sample is valid for training
+    """
+    html_content = sample.get("html_table", "")
+    
+    # Check if html_table exists and is not empty
+    if not html_content or len(html_content.strip()) < 10:
+        return False
+    
+    # Clean the HTML first
+    cleaned_html = clean_html_content(html_content)
+    
+    # Check for basic table structure after cleaning
+    if "<table" not in cleaned_html.lower():
+        return False
+    
+    # Check for balanced table tags
+    table_open = cleaned_html.lower().count("<table")
+    table_close = cleaned_html.lower().count("</table>")
+    if table_open != table_close or table_open == 0:
+        return False
+    
+    # Check for reasonable content length (not too short or extremely long)
+    if len(cleaned_html) < 20 or len(cleaned_html) > 50000:  # Adjust limits as needed
+        return False
+    
+    # Check if image exists
+    if "image" not in sample or sample["image"] is None:
+        return False
+    
+    return True
+
+def apply_html_filtering(dataset, dataset_name):
+    """
+    Apply HTML cleaning and filtering to dataset.
+    
+    Args:
+        dataset: Input dataset to filter
+        dataset_name: Name for logging purposes
+        
+    Returns:
+        list: Filtered dataset with cleaned HTML
+    """
+    print(f"Applying HTML filtering to {dataset_name} dataset...")
+    print(f"Original {dataset_name} dataset size: {len(dataset)}")
+    
+    filtered_samples = []
+    invalid_count = 0
+    
+    for i, sample in enumerate(dataset):
+        if is_valid_html_sample(sample):
+            # Clean the HTML content
+            cleaned_sample = sample.copy()
+            cleaned_sample["html_table"] = clean_html_content(sample["html_table"])
+            filtered_samples.append(cleaned_sample)
+        else:
+            invalid_count += 1
+        
+        # Progress logging
+        if (i + 1) % 1000 == 0:
+            print(f"Processed {i + 1}/{len(dataset)} samples...")
+    
+    print(f"Filtered {dataset_name} dataset size: {len(filtered_samples)}")
+    print(f"Removed {invalid_count} invalid samples from {dataset_name}")
+    print(f"Filtering efficiency: {len(filtered_samples)/len(dataset)*100:.2f}%")
+    print()
+    
+    return filtered_samples
+
+# Apply HTML filtering to both datasets
+filtered_train_dataset = apply_html_filtering(train_dataset, "training")
+filtered_val_dataset = apply_html_filtering(val_dataset, "validation")
 
 """
 To format the dataset, all vision finetuning tasks should be formatted as follows:
@@ -80,7 +184,14 @@ To format the dataset, all vision finetuning tasks should be formatted as follow
 """
 
 # Define instruction for the task
-instruction = "Write the html representation for this image."
+instruction = """Convert this table image to HTML format with proper formatting.
+
+Requirements:
+- Table tag: <table border='1' style='border-collapse: collapse; width: 100%;'>
+- Proper word spacing in cells
+- Space before annotations: "word A" not "wordA", "text 1" not "text1"
+
+Output clean, properly formatted HTML table code. Do not include any additional text or explanations."""
 
 def convert_to_conversation(sample):
     """Convert dataset sample to conversation format required for training."""
@@ -95,15 +206,18 @@ def convert_to_conversation(sample):
         {
             "role": "assistant",
             "content": [
-                {"type": "text", "text": sample["html_table"]}
+                {"type": "text", "text": sample["html_table"]}  # Already cleaned by filtering
             ]
         },
     ]
     return {"messages": conversation}
 
-# Convert datasets to conversation format
-converted_train_dataset = [convert_to_conversation(sample) for sample in train_dataset]
-converted_val_dataset = [convert_to_conversation(sample) for sample in val_dataset]
+# Convert filtered datasets to conversation format
+converted_train_dataset = [convert_to_conversation(sample) for sample in filtered_train_dataset]
+converted_val_dataset = [convert_to_conversation(sample) for sample in filtered_val_dataset]
+
+print(f"Final training dataset size: {len(converted_train_dataset)}")
+print(f"Final validation dataset size: {len(converted_val_dataset)}")
 
 """### Pre-Training Inference on Table Samples"""
 
@@ -173,28 +287,9 @@ def run_batch_inference(model, tokenizer, folder_path, output_folder):
                     do_sample=False  # Use greedy decoding for consistency
                 )
             
-            # Decode output
-            # pred_text = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-            
-            # Save HTML file
-            # base_name = Path(image_file).stem
-            # html_filename = f"{base_name}.html"
-            # html_path = os.path.join(output_folder, html_filename)
-            
-            # with open(html_path, 'w', encoding='utf-8') as f:
-            #    f.write(pred_text)
-            
-            # Decode and clean output
+            # Decode and clean output using the same cleaning function
             pred_text = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-
-            # Strip surrounding ```html ... ``` or <html>...</html> blocks if present
-            pred_text = pred_text.strip()
-            pred_text = re.sub(r'^```(?:html)?\s*', '', pred_text, flags=re.IGNORECASE)
-            pred_text = re.sub(r'\s*```$', '', pred_text)
-            pred_text = re.sub(r'^<html>\s*', '', pred_text, flags=re.IGNORECASE)
-            pred_text = re.sub(r'\s*</html>$', '', pred_text, flags=re.IGNORECASE)
-            pred_text = re.sub(r'^<body>\s*', '', pred_text, flags=re.IGNORECASE)
-            pred_text = re.sub(r'\s*</body>$', '', pred_text, flags=re.IGNORECASE)
+            pred_text = clean_html_content(pred_text)
 
             # Save cleaned HTML
             base_name = Path(image_file).stem
@@ -251,7 +346,7 @@ def evaluate_table_recognition(model, tokenizer, val_dataset, num_samples):
     Args:
         model: The trained model
         tokenizer: Model tokenizer
-        val_dataset: Validation dataset
+        val_dataset: Validation dataset (filtered)
         num_samples: Number of samples to evaluate (default 50 for speed)
     
     Returns:
@@ -270,7 +365,7 @@ def evaluate_table_recognition(model, tokenizer, val_dataset, num_samples):
     for i in range(eval_samples):
         sample = val_dataset[i]
         image = sample["image"]
-        gt_html = sample["html_table"]
+        gt_html = sample["html_table"]  # Already cleaned by filtering
         
         # Generate prediction
         messages = [
@@ -297,8 +392,9 @@ def evaluate_table_recognition(model, tokenizer, val_dataset, num_samples):
                 do_sample=False  # Use greedy decoding for consistent evaluation
             )
         
-        # Decode prediction
+        # Decode and clean prediction using the same cleaning function
         pred_text = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+        pred_text = clean_html_content(pred_text)
         
         # Calculate TEDS scores
         try:
@@ -385,15 +481,14 @@ trainer = SFTTrainer(
     eval_dataset=converted_val_dataset, 
 
     args=SFTConfig(
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
-        warmup_steps=20,
-        # max_steps=200,  # Alternative to epochs
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        warmup_ratio=0.1,
         num_train_epochs=3,
-        learning_rate=5e-5,              # Reduced
-        logging_steps=5,                 # Log more frequently
+        learning_rate=2e-5,
+        logging_steps=5,
         optim="adamw_8bit",
-        weight_decay=0.01,               # Reduced
+        weight_decay=0.1,
         lr_scheduler_type="cosine",
         seed=3407,
         output_dir="outputs",
@@ -402,8 +497,14 @@ trainer = SFTTrainer(
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
         max_seq_length=2048,
-        save_strategy="epoch",
-        eval_strategy="epoch",
+        save_strategy="steps",
+        save_steps=28,
+        eval_strategy="steps",
+        eval_steps=14,
+        dataloader_pin_memory=False,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     ),
 )
 
