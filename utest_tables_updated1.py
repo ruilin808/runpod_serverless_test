@@ -241,12 +241,20 @@ To format the dataset, all vision finetuning tasks should be formatted as follow
 """
 
 # Define instruction for the task
+#instruction = """Convert this table image to HTML format with proper formatting.
+
+#Requirements:
+#- Table tag: <table border='1' style='border-collapse: collapse; width: 100%;'>
+#- Proper word spacing in cells
+#- Space before annotations: "word A" not "wordA", "text 1" not "text1"
+
+#Output clean, properly formatted HTML table code. Do not include any additional text or explanations."""
+
 instruction = """Convert this table image to HTML format with proper formatting.
 
 Requirements:
 - Table tag: <table border='1' style='border-collapse: collapse; width: 100%;'>
 - Proper word spacing in cells
-- Space before annotations: "word A" not "wordA", "text 1" not "text1"
 
 Output clean, properly formatted HTML table code. Do not include any additional text or explanations."""
 
