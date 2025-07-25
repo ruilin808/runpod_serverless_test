@@ -21,8 +21,9 @@ from pathlib import Path
 # Load the base model
 model, tokenizer = FastVisionModel.from_pretrained(
     "unsloth/Qwen2.5-VL-32B-Instruct",
-    load_in_4bit=False,  # Use 4bit to reduce memory use. False for 16bit LoRA.
+    load_in_4bit=True,  # Use 4bit to reduce memory use. False for 16bit LoRA.
     use_gradient_checkpointing="unsloth",  # True or "unsloth" for long context
+    device_map="balanced",
 )
 
 """
