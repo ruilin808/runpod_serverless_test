@@ -400,107 +400,107 @@ def run_inference_on_samples(model, tokenizer, samples, output_folder, stage_nam
 # run_inference_on_samples(model, tokenizer, inference_samples, "pre_training_outputs", "Pre-training")
 
 """
-### Table Recognition Metrics Setup
-Install and setup TEDS (Tree Edit Distance based Similarity) for table structure evaluation.
+### Table Recognition Metrics Setup - TEDS COMMENTED OUT
+# Install and setup TEDS (Tree Edit Distance based Similarity) for table structure evaluation.
 """
 
-# Install TEDS for table recognition evaluation
-try:
-    from table_recognition_metric import TEDS
-except ImportError:
-    print("Installing table_recognition_metric...")
-    import subprocess
-    subprocess.check_call(["pip", "install", "table_recognition_metric"])
-    from table_recognition_metric import TEDS
+# # Install TEDS for table recognition evaluation
+# try:
+#     from table_recognition_metric import TEDS
+# except ImportError:
+#     print("Installing table_recognition_metric...")
+#     import subprocess
+#     subprocess.check_call(["pip", "install", "table_recognition_metric"])
+#     from table_recognition_metric import TEDS
 
-# Initialize TEDS metrics
-teds_structure_only = TEDS(structure_only=True)
-teds_full = TEDS(structure_only=False)
+# # Initialize TEDS metrics
+# teds_structure_only = TEDS(structure_only=True)
+# teds_full = TEDS(structure_only=False)
 
-def evaluate_table_recognition(model, tokenizer, val_dataset, num_samples):
-    """
-    Evaluate table recognition performance using TEDS metrics.
+# def evaluate_table_recognition(model, tokenizer, val_dataset, num_samples):
+#     """
+#     Evaluate table recognition performance using TEDS metrics.
     
-    Args:
-        model: The trained model
-        tokenizer: Model tokenizer
-        val_dataset: Validation dataset (filtered)
-        num_samples: Number of samples to evaluate
+#     Args:
+#         model: The trained model
+#         tokenizer: Model tokenizer
+#         val_dataset: Validation dataset (filtered)
+#         num_samples: Number of samples to evaluate
     
-    Returns:
-        Dictionary containing TEDS scores
-    """
-    FastVisionModel.for_inference(model)
+#     Returns:
+#         Dictionary containing TEDS scores
+#     """
+#     FastVisionModel.for_inference(model)
     
-    teds_structure_scores = []
-    teds_full_scores = []
+#     teds_structure_scores = []
+#     teds_full_scores = []
     
-    # Limit evaluation samples for efficiency (but respect small validation set)
-    eval_samples = min(num_samples, len(val_dataset))
+#     # Limit evaluation samples for efficiency (but respect small validation set)
+#     eval_samples = min(num_samples, len(val_dataset))
     
-    print(f"Evaluating on {eval_samples} validation samples...")
+#     print(f"Evaluating on {eval_samples} validation samples...")
     
-    for i in range(eval_samples):
-        sample = val_dataset[i]
-        image = sample["image"]
-        gt_html = sample["html_table"]  # Already cleaned by filtering
+#     for i in range(eval_samples):
+#         sample = val_dataset[i]
+#         image = sample["image"]
+#         gt_html = sample["html_table"]  # Already cleaned by filtering
         
-        # Generate prediction
-        messages = [
-            {"role": "user", "content": [
-                {"type": "image"},
-                {"type": "text", "text": instruction}
-            ]}
-        ]
-        input_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        inputs = tokenizer(
-            image,
-            input_text,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).to("cuda")
+#         # Generate prediction
+#         messages = [
+#             {"role": "user", "content": [
+#                 {"type": "image"},
+#                 {"type": "text", "text": instruction}
+#             ]}
+#         ]
+#         input_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+#         inputs = tokenizer(
+#             image,
+#             input_text,
+#             add_special_tokens=False,
+#             return_tensors="pt",
+#         ).to("cuda")
         
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs, 
-                max_new_tokens=8000,
-                use_cache=True, 
-                temperature=1.5, 
-                min_p=0.1,
-                do_sample=False  # Use greedy decoding for consistent evaluation
-            )
+#         with torch.no_grad():
+#             outputs = model.generate(
+#                 **inputs, 
+#                 max_new_tokens=8000,
+#                 use_cache=True, 
+#                 temperature=1.5, 
+#                 min_p=0.1,
+#                 do_sample=False  # Use greedy decoding for consistent evaluation
+#             )
         
-        # Decode and clean prediction using the same cleaning function
-        pred_text = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-        pred_text = clean_html_content(pred_text)
+#         # Decode and clean prediction using the same cleaning function
+#         pred_text = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+#         pred_text = clean_html_content(pred_text)
         
-        # Calculate TEDS scores
-        try:
-            teds_structure_score = teds_structure_only(gt_html, pred_text)
-            teds_full_score = teds_full(gt_html, pred_text)
+#         # Calculate TEDS scores
+#         try:
+#             teds_structure_score = teds_structure_only(gt_html, pred_text)
+#             teds_full_score = teds_full(gt_html, pred_text)
             
-            teds_structure_scores.append(teds_structure_score)
-            teds_full_scores.append(teds_full_score)
-        except Exception as e:
-            print(f"Error evaluating sample {i}: {e}")
-            # Add 0 score for failed evaluations
-            teds_structure_scores.append(0.0)
-            teds_full_scores.append(0.0)
+#             teds_structure_scores.append(teds_structure_score)
+#             teds_full_scores.append(teds_full_score)
+#         except Exception as e:
+#             print(f"Error evaluating sample {i}: {e}")
+#             # Add 0 score for failed evaluations
+#             teds_structure_scores.append(0.0)
+#             teds_full_scores.append(0.0)
         
-        if (i + 1) % 5 == 0:
-            print(f"Evaluated {i + 1}/{eval_samples} samples")
+#         if (i + 1) % 5 == 0:
+#             print(f"Evaluated {i + 1}/{eval_samples} samples")
     
-    # Calculate average scores
-    avg_teds_structure = sum(teds_structure_scores) / len(teds_structure_scores)
-    avg_teds_full = sum(teds_full_scores) / len(teds_full_scores)
+#     # Calculate average scores
+#     avg_teds_structure = sum(teds_structure_scores) / len(teds_structure_scores)
+#     avg_teds_full = sum(teds_full_scores) / len(teds_full_scores)
     
-    results = {
-        "teds_structure_only": avg_teds_structure,
-        "teds_full": avg_teds_full,
-        "num_evaluated": eval_samples
-    }
+#     results = {
+#         "teds_structure_only": avg_teds_structure,
+#         "teds_full": avg_teds_full,
+#         "num_evaluated": eval_samples
+#     }
     
-    return results
+#     return results
 
 """
 ### Model Training - Conservative Option 1
@@ -510,36 +510,36 @@ Optimized hyperparameters for small dataset (1.13k samples) with high regulariza
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
 
-# Custom callback for validation evaluation (adjusted for small dataset)
+# Custom callback for validation evaluation (adjusted for small dataset) - TEDS COMMENTED OUT
 from transformers import TrainerCallback
 
-class TableRecognitionCallback(TrainerCallback):
-    """Custom callback to evaluate table recognition performance during training."""
+# class TableRecognitionCallback(TrainerCallback):
+#     """Custom callback to evaluate table recognition performance during training."""
     
-    def __init__(self, model, tokenizer, val_dataset, eval_steps=30):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.val_dataset = val_dataset
-        self.eval_steps = eval_steps
+#     def __init__(self, model, tokenizer, val_dataset, eval_steps=30):
+#         self.model = model
+#         self.tokenizer = tokenizer
+#         self.val_dataset = val_dataset
+#         self.eval_steps = eval_steps
         
-    def on_log(self, args, state, control, model=None, **kwargs):
-        """Run evaluation at specified intervals during training."""
-        if state.global_step % self.eval_steps == 0 and state.global_step > 0:
-            print(f"\nRunning table recognition evaluation at step {state.global_step}...")
+#     def on_log(self, args, state, control, model=None, **kwargs):
+#         """Run evaluation at specified intervals during training."""
+#         if state.global_step % self.eval_steps == 0 and state.global_step > 0:
+#             print(f"\nRunning table recognition evaluation at step {state.global_step}...")
             
-            # Evaluate table recognition (use fewer samples for small validation set)
-            eval_samples = min(10, len(self.val_dataset))
-            metrics = evaluate_table_recognition(
-                self.model, 
-                self.tokenizer, 
-                self.val_dataset, 
-                num_samples=eval_samples
-            )
+#             # Evaluate table recognition (use fewer samples for small validation set)
+#             eval_samples = min(10, len(self.val_dataset))
+#             metrics = evaluate_table_recognition(
+#                 self.model, 
+#                 self.tokenizer, 
+#                 self.val_dataset, 
+#                 num_samples=eval_samples
+#             )
             
-            # Log metrics
-            print(f"TEDS Structure Only: {metrics['teds_structure_only']:.4f}")
-            print(f"TEDS Full: {metrics['teds_full']:.4f}")
-            print()  # Add spacing
+#             # Log metrics
+#             print(f"TEDS Structure Only: {metrics['teds_structure_only']:.4f}")
+#             print(f"TEDS Full: {metrics['teds_full']:.4f}")
+#             print()  # Add spacing
 
 FastVisionModel.for_training(model)  # Enable for training!
 
@@ -564,14 +564,14 @@ print(f"- Steps per epoch: ~{steps_per_epoch}")
 print(f"- Total training steps: ~{total_steps}")
 print("="*60)
 
-# Configure and create trainer with conservative settings
+# Configure and create trainer with conservative settings (TEDS callback commented out)
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     data_collator=UnslothVisionDataCollator(model, tokenizer),  # Must use!
     train_dataset=converted_train_dataset,
     eval_dataset=converted_val_dataset, 
-    callbacks=[TableRecognitionCallback(model, tokenizer, filtered_val_dataset, eval_steps=30)],
+    # callbacks=[TableRecognitionCallback(model, tokenizer, filtered_val_dataset, eval_steps=30)],  # COMMENTED OUT
     max_seq_length=2048,                       # MOVED from SFTConfig to SFTTrainer
 
     args=SFTConfig(
@@ -630,24 +630,24 @@ print("POST-TRAINING INFERENCE")
 print("="*60)
 run_inference_on_samples(model, tokenizer, inference_samples, "post_training_outputs", "Post-training")
 
-"""### Final Evaluation on Full Validation Set"""
+"""### Final Evaluation on Full Validation Set - TEDS COMMENTED OUT"""
 
-print("="*60)
-print("FINAL EVALUATION")
-print("="*60)
+# print("="*60)
+# print("FINAL EVALUATION")
+# print("="*60)
 
-# Run comprehensive evaluation on the full validation set
-final_metrics = evaluate_table_recognition(
-    model, 
-    tokenizer, 
-    filtered_val_dataset, 
-    num_samples=len(filtered_val_dataset)  # Evaluate on full validation set
-)
+# # Run comprehensive evaluation on the full validation set
+# final_metrics = evaluate_table_recognition(
+#     model, 
+#     tokenizer, 
+#     filtered_val_dataset, 
+#     num_samples=len(filtered_val_dataset)  # Evaluate on full validation set
+# )
 
-print("Final Performance Metrics:")
-print(f"TEDS Structure Only: {final_metrics['teds_structure_only']:.4f}")
-print(f"TEDS Full: {final_metrics['teds_full']:.4f}")
-print(f"Evaluated on {final_metrics['num_evaluated']} validation samples")
+# print("Final Performance Metrics:")
+# print(f"TEDS Structure Only: {final_metrics['teds_structure_only']:.4f}")
+# print(f"TEDS Full: {final_metrics['teds_full']:.4f}")
+# print(f"Evaluated on {final_metrics['num_evaluated']} validation samples")
 
 """
 ### Saving Finetuned Models
@@ -684,6 +684,7 @@ print("- Validation samples:", len(converted_val_dataset))
 print("- Epochs: 1 (conservative)")
 print("- Learning rate: 1e-5 (reduced)")
 print("- Regularization: Increased (weight_decay=0.2, lora_dropout=0.2)")
+print("- TEDS evaluation: COMMENTED OUT")
 print("="*60)
 print("OUTPUT LOCATIONS:")
 print("Ground truth HTML files saved in: html/")
