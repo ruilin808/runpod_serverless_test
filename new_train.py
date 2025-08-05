@@ -572,6 +572,7 @@ trainer = SFTTrainer(
     train_dataset=converted_train_dataset,
     eval_dataset=converted_val_dataset, 
     callbacks=[TableRecognitionCallback(model, tokenizer, filtered_val_dataset, eval_steps=30)],
+    max_seq_length=2048,                       # MOVED from SFTConfig to SFTTrainer
 
     args=SFTConfig(
         per_device_train_batch_size=1,
@@ -589,7 +590,6 @@ trainer = SFTTrainer(
         remove_unused_columns=False,
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
-        max_seq_length=2048,
         save_strategy="steps",
         save_steps=60,                         # ADJUSTED for smaller dataset
         eval_strategy="steps",
