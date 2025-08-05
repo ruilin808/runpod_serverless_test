@@ -394,10 +394,10 @@ def run_inference_on_samples(model, tokenizer, samples, output_folder, stage_nam
     print(f"{stage_name} inference completed!\n")
 
 # Run pre-training inference
-print("="*60)
-print("PRE-TRAINING INFERENCE")
-print("="*60)
-run_inference_on_samples(model, tokenizer, inference_samples, "pre_training_outputs", "Pre-training")
+# print("="*60)
+# print("PRE-TRAINING INFERENCE")
+# print("="*60)
+# run_inference_on_samples(model, tokenizer, inference_samples, "pre_training_outputs", "Pre-training")
 
 """
 ### Table Recognition Metrics Setup
