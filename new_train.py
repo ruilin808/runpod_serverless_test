@@ -290,7 +290,14 @@ instruction = """Convert this table image to HTML format with proper formatting.
 
 Requirements:
 - Table tag: <table border='1' style='border-collapse: collapse; width: 100%;'>
+- Use <th> tags for header rows, <td> for data cells
 - Proper word spacing in cells
+- Handle merged cells with appropriate colspan/rowspan attributes
+- Preserve original table structure and formatting
+- Use <sup></sup> for superscript text
+- Keep special characters as-is (don't convert <, ≤, ≥ to HTML entities)
+- Maintain exact cell content from image, including any grammar errors
+- Do NOT preserve footnotes or references below the table
 
 Output clean, properly formatted HTML table code. Do not include any additional text or explanations."""
 
