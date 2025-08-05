@@ -677,8 +677,8 @@ if False:
     model.save_pretrained_merged("unsloth_finetune", tokenizer)
 
 # To export and save to your Hugging Face account
-if False: 
-    model.push_to_hub_merged("YOUR_USERNAME/unsloth_finetune", tokenizer, token="PUT_HERE")
+if True: 
+    model.push_to_hub_merged("ruilin808/unsloth_finetune", tokenizer, token=HF)
 
 print("\n" + "="*60)
 print("SCRIPT COMPLETED SUCCESSFULLY!")
